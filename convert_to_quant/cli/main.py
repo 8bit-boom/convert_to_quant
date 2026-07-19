@@ -277,11 +277,12 @@ def get_parser() -> MultiHelpArgumentParser:
         help="Optimization algorithm."
     )
     parser.add_argument(
-        "--num_iter", "--num-iter", type=int, default=4000, dest="num_iter", help="Total optimization iterations per tensor."
+        "--num_iter", "--num-iter", type=int, default=4000, dest="num_iter",
+        help="Maximum learned-optimization iterations per layer."
     )
     parser.add_argument(
         "--auto-tune", action="store_true", dest="auto_tune",
-        help="Automatically probe and adapt learned-rounding convergence within --num-iter."
+        help="Use deterministic adaptive convergence control within --num-iter."
     )
     parser.add_argument(
         "--auto-tune-report", type=str, default=None, dest="auto_tune_report",

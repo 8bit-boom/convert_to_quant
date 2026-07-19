@@ -407,9 +407,12 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
 
         # Scale refinement interval (for iterative mode only)
         if self.scale_optimization == "iterative" and self.scale_refinement_rounds > 1:
-            scale_update_interval = max(1, self.num_iter // self.scale_refinement_rounds)
+            scale_update_interval = self._optimization_schedule_interval(
+                self.scale_refinement_rounds
+            )
         else:
-            scale_update_interval = self.num_iter + 1  # Never update for fixed/joint
+            scale_update_interval = self.OPTIMIZATION_SCHEDULE_HORIZON + 1
+        scale_updates = 0
 
         mode_suffix = f"-{self.scale_optimization}" if self.scale_optimization != "fixed" else ""
         pbar = tqdm(
@@ -419,7 +422,12 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
 
         for i in pbar:
             # Iterative scale refinement: recompute scales periodically (iterative mode only)
-            if self.scale_optimization == "iterative" and i > 0 and i % scale_update_interval == 0:
+            if (
+                self.scale_optimization == "iterative"
+                and scale_updates < self.scale_refinement_rounds - 1
+                and i > 0
+                and i % scale_update_interval == 0
+            ):
                 # Dequantize current state
                 current_dq = self._nvfp4_dequantize_blockwise(W_q_refined, current_total_scale, M, N)
                 # Recompute scales from current dequantized weights
@@ -427,12 +435,19 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                     current_dq, per_tensor_scale, M, N
                 )
                 current_total_scale = new_total_scale
+                scale_updates += 1
+                if self._active_auto_controller is not None:
+                    self._active_auto_controller.record_policy_event({
+                        "kind": "nvfp4_scale_refinement",
+                        "iteration": i,
+                        "refinement": scale_updates,
+                    })
                 # Re-normalize W_q to new scale
                 tensor_blocks_new = current_dq.reshape(M, -1, self.block_size)
                 W_q_refined = (tensor_blocks_new / current_total_scale.unsqueeze(-1)).view(M, N)
                 W_q_refined = torch.clamp(W_q_refined, -FP4_E2M1_MAX, FP4_E2M1_MAX)
                 if self.scale_optimization == "iterative":
-                    pbar.set_description(f"    Optimizing NVFP4 (scale update {i // scale_update_interval + 1})")
+                    pbar.set_description(f"    Optimizing NVFP4 (scale update {scale_updates})")
 
             # For joint mode: apply STE to block scales before dequantization
             if self.scale_optimization == "joint":

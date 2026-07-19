@@ -1132,8 +1132,19 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 optimizer.zero_grad()
 
             # Forward pass: Optimized soft rounding (smooth AdaRound)
-            # Calculate current temperature (linear decay from T_start to T_end)
-            temp = T_start + (T_end - T_start) * (i / self.num_iter)
+            # Temperature follows an absolute policy clock. num_iter is only
+            # the maximum budget and must not stretch the annealing trajectory.
+            anneal_progress = self._optimization_schedule_progress(i)
+            temp = T_start + (T_end - T_start) * anneal_progress
+            if (
+                self._active_auto_controller is not None
+                and i % self._active_auto_controller.window == 0
+            ):
+                self._active_auto_controller.record_policy_event({
+                    "kind": "adaround_temperature",
+                    "iteration": i,
+                    "temperature": temp,
+                })
             h_V = torch.sigmoid(V / temp)
             # Use soft weights for smooth gradient flow during optimization
             W_q = W_floor + h_V

@@ -40,6 +40,8 @@ class BaseLearnedConverter(ABC):
     - convert(): Format-specific quantization logic
     """
 
+    OPTIMIZATION_SCHEDULE_HORIZON = 2000
+
     def __init__(
         self,
         optimizer: str = "prodigy",
@@ -129,7 +131,8 @@ class BaseLearnedConverter(ABC):
                 raise ImportError("User needs to run `pip install prodigy-plus-schedule-free` to use the prodigy optimizer.")
 
         self.num_iter = num_iter
-        self.lr = lr
+        self.configured_lr = lr
+        self.lr = 1.0 if self.optimizer_choice == "prodigy" else lr
         self.no_learned_rounding = no_learned_rounding
         self.optimizer_kwargs = kwargs
 
@@ -186,8 +189,20 @@ class BaseLearnedConverter(ABC):
             return method(*args, **kwargs)
         return self._run_auto_tuned_optimizer(method, args, kwargs, method_name)
 
+    def _optimizer_initial_lr(self) -> float:
+        """Return the optimizer-family starting learning rate."""
+        return 1.0 if self.optimizer_choice == "prodigy" else self.lr
+
+    def _optimization_schedule_progress(self, iteration: int) -> float:
+        """Return budget-independent progress for internal policy schedules."""
+        return min(max(iteration, 0) / self.OPTIMIZATION_SCHEDULE_HORIZON, 1.0)
+
+    def _optimization_schedule_interval(self, parts: int) -> int:
+        """Split the fixed policy horizon without consulting num_iter."""
+        return max(1, self.OPTIMIZATION_SCHEDULE_HORIZON // max(1, parts))
+
     def _run_auto_tuned_optimizer(self, method, args, kwargs, method_name: str):
-        """Run LR probes, one selected attempt, and at most one recovery."""
+        """Run one continuous attempt and at most one bounded recovery."""
         weight = next((arg for arg in args if isinstance(arg, torch.Tensor) and arg.ndim >= 2), None)
         if weight is None:
             return method(*args, **kwargs)
@@ -216,12 +231,11 @@ class BaseLearnedConverter(ABC):
             "early_stop_stall": self.early_stop_stall,
         }
         total_budget = self.num_iter
-        anchor_lr = self.lr
+        configured_lr = self.configured_lr
+        initial_lr = self._optimizer_initial_lr()
         window = convergence_window(shape, rank)
-        probe_steps = max(8, window // 2)
-        use_probes = total_budget >= 6 * probe_steps
         attempts = []
-        selected_lr = anchor_lr
+        selected_lr = initial_lr
         consumed = 0
         result = None
         result_loss = math.inf
@@ -240,11 +254,9 @@ class BaseLearnedConverter(ABC):
             restore_rng()
             self.num_iter = budget
             self.lr = lr
-            self.lr_schedule = "adaptive"
-            self.lr_adaptive_mode = "simple-reset"
-            self.early_stop_loss = -1.0
-            self.early_stop_lr = 1e-12
-            self.early_stop_stall = budget + 1
+            # Preserve absolute convergence policy. The attempt budget is only
+            # a ceiling and must not stretch patience or schedule behavior.
+            self.early_stop_stall = original["early_stop_stall"]
             controller = AdaptiveConvergenceController(
                 shape=shape,
                 rank=rank,
@@ -262,30 +274,14 @@ class BaseLearnedConverter(ABC):
             return attempt_result, controller
 
         try:
-            probe_results = []
-            if use_probes:
-                for multiplier in (0.25, 1.0, 4.0):
-                    candidate_lr = anchor_lr * multiplier
-                    _, controller = run_attempt(candidate_lr, probe_steps, "probe")
-                    probe_results.append((controller.score(), candidate_lr, controller))
-                    consumed += controller.summary.iterations
-                stable = [item for item in probe_results if not item[2].retry_recommended]
-                candidates = stable or probe_results
-                selected_lr = max(candidates, key=lambda item: item[0])[1]
-
-            remaining = max(1, total_budget - consumed)
-            result, controller = run_attempt(selected_lr, remaining, "selected")
+            result, controller = run_attempt(selected_lr, total_budget, "selected")
             consumed += controller.summary.iterations
             result_loss = controller.best_loss
 
             remaining = total_budget - consumed
             if controller.retry_recommended and remaining >= max(8, window // 2):
                 retried = True
-                stable_probe_lrs = [
-                    summary.lr for summary in attempts
-                    if summary.kind == "probe" and summary.retry_reason is None
-                ]
-                retry_lr = min(stable_probe_lrs) if stable_probe_lrs else anchor_lr * 0.1
+                retry_lr = 1.0 if self.optimizer_choice == "prodigy" else initial_lr * 0.1
                 retry_result, retry_controller = run_attempt(retry_lr, remaining, "retry")
                 consumed += retry_controller.summary.iterations
                 if retry_controller.best_loss < result_loss:
@@ -302,16 +298,28 @@ class BaseLearnedConverter(ABC):
                 "rank": rank,
                 "converter": type(self).__name__,
                 "optimizer": self.optimizer_choice,
+                "optimizer_policy": (
+                    "prodigy_fixed_start" if self.optimizer_choice == "prodigy"
+                    else "configured_start"
+                ),
+                "scheduler": original["lr_schedule"],
                 "method": method_name,
                 "budget": total_budget,
                 "iterations": consumed,
                 "window": window,
-                "lr_anchor": anchor_lr,
+                "schedule_horizon": self.OPTIMIZATION_SCHEDULE_HORIZON,
+                "configured_lr": configured_lr,
+                "effective_initial_lr": initial_lr,
+                "lr_anchor": configured_lr,
                 "selected_lr": selected_lr,
                 "retried": retried,
                 "stop_reason": selected_summary.stop_reason,
                 "best_loss": selected_summary.best_loss,
                 "normalized_best_loss": selected_summary.normalized_best_loss,
+                "budget_exhausted": (
+                    selected_summary.stop_reason == "budget"
+                    and selected_summary.iterations >= selected_summary.budget
+                ),
                 "attempts": [summary.as_dict() for summary in attempts],
             }
             self._tuning_report_collector.add(record)
@@ -511,11 +519,6 @@ class BaseLearnedConverter(ABC):
         Returns:
             Tuple of (new_lr, lr_was_updated)
         """
-        if self._active_auto_controller is not None:
-            if self._active_auto_controller.should_stop:
-                return 0.0, True
-            return self._active_auto_controller.update_lr(curr_lr)
-
         M, N = tensor_shape
         shape_ratio = abs(M - N) / max(M, N)  # 0 for square, ~1 for very skewed
 

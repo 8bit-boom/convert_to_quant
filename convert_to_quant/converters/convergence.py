@@ -47,6 +47,7 @@ class AttemptSummary:
     stop_reason: str = "budget"
     retry_reason: Optional[str] = None
     lr_events: List[Dict[str, Any]] = field(default_factory=list)
+    policy_events: List[Dict[str, Any]] = field(default_factory=list)
     windows: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -60,8 +61,10 @@ class AttemptSummary:
             "final_loss": _finite_or_none(self.final_loss),
             "normalized_best_loss": _finite_or_none(self.normalized_best_loss),
             "stop_reason": self.stop_reason,
+            "budget_exhausted": self.stop_reason == "budget" and self.iterations >= self.budget,
             "retry_reason": self.retry_reason,
             "lr_events": self.lr_events,
+            "policy_events": self.policy_events,
             "windows": self.windows,
         }
 
@@ -87,7 +90,7 @@ class TuningReportCollector:
             reasons[reason] = reasons.get(reason, 0) + 1
             retries += int(layer.get("retried", False))
         return {
-            "version": 1,
+            "version": 2,
             "mode": "auto",
             "profile": "balanced",
             "summary": {
@@ -133,23 +136,28 @@ class AdaptiveConvergenceController:
         self.rank = rank
         self.optimizer = optimizer
         self.window = convergence_window(shape, rank)
-        self.warmup = min(budget, max(50 if optimizer == "prodigy" else 0, 2 * self.window))
+        # Warmup is an absolute policy duration. The budget may stop a run
+        # before warmup completes, but must never change the trajectory.
+        self.warmup = max(50 if optimizer == "prodigy" else 0, 2 * self.window)
         self.summary = AttemptSummary(kind=kind, lr=initial_lr, budget=budget)
         self.losses: List[float] = []
         self.best_history: List[float] = []
         self.plateau_windows = 0
         self.stable_windows = 0
-        self.lr_reductions = 0
         self.should_stop = False
         self.retry_recommended = False
-        self._pending_lr_factor: Optional[float] = None
 
     @property
     def best_loss(self) -> float:
         return self.summary.best_loss if self.summary.best_loss is not None else math.inf
 
     def observe(self, current_loss: float, previous_best: float) -> bool:
-        """Record a step and return whether it is a meaningful new best."""
+        """Record a step and return whether it is a strict finite new best.
+
+        Noise-aware significance remains internal to convergence decisions.
+        Best-state capture must not discard a real improvement merely because
+        it is smaller than the current noise estimate.
+        """
         first_observation = self.summary.initial_loss is None
         self.summary.iterations += 1
         self.summary.final_loss = current_loss
@@ -176,7 +184,10 @@ class AdaptiveConvergenceController:
         center = median(recent_deltas) if recent_deltas else 0.0
         noise = median([abs(value - center) for value in recent_deltas]) if recent_deltas else 0.0
         meaningful_floor = max(1e-6, 3.0 * noise)
-        improved = first_observation or (current_loss < prior and relative_delta > meaningful_floor)
+        strict_improved = first_observation or current_loss < prior
+        meaningful_improved = first_observation or (
+            strict_improved and relative_delta > meaningful_floor
+        )
 
         self.losses.append(current_loss)
         if current_loss < prior:
@@ -192,7 +203,11 @@ class AdaptiveConvergenceController:
         if self.summary.iterations % self.window == 0:
             self._evaluate_window(scale)
 
-        return improved
+        if meaningful_improved:
+            self.plateau_windows = 0
+            self.stable_windows = 0
+
+        return strict_improved
 
     def _evaluate_window(self, scale: float) -> None:
         if len(self.best_history) < self.window + 1:
@@ -218,7 +233,6 @@ class AdaptiveConvergenceController:
         if plateau:
             self.plateau_windows += 1
             self.stable_windows = self.stable_windows + 1 if quiet else 0
-            self._pending_lr_factor = 0.8 if quiet else 0.5
         else:
             self.plateau_windows = 0
             self.stable_windows = 0
@@ -233,34 +247,10 @@ class AdaptiveConvergenceController:
             self.summary.iterations >= self.warmup
             and self.plateau_windows >= 3
             and self.stable_windows >= 2
-            and self.lr_reductions >= 1
         ):
             self.should_stop = True
             self.summary.stop_reason = "converged_plateau"
 
-    def update_lr(self, current_lr: float) -> Tuple[float, bool]:
-        if self._pending_lr_factor is None:
-            return current_lr, False
-        factor = self._pending_lr_factor
-        self._pending_lr_factor = None
-        new_lr = max(current_lr * factor, max(self.summary.lr * 1e-6, 1e-12))
-        if new_lr == current_lr:
-            return current_lr, False
-        self.lr_reductions += 1
-        self.summary.lr_events.append({
-            "iteration": self.summary.iterations,
-            "old_lr": current_lr,
-            "new_lr": new_lr,
-            "factor": factor,
-        })
-        return new_lr, True
-
-    def score(self) -> float:
-        if self.summary.initial_loss is None or self.summary.best_loss is None:
-            return -math.inf
-        if not math.isfinite(self.summary.best_loss):
-            return -math.inf
-        scale = max(abs(self.summary.initial_loss), 1e-30)
-        gain = max(0.0, (self.summary.initial_loss - self.summary.best_loss) / scale)
-        instability_penalty = 1.0 if self.retry_recommended else 0.0
-        return gain / max(1, self.summary.iterations) - instability_penalty
+    def record_policy_event(self, event: Dict[str, Any]) -> None:
+        """Record a compact format-specific schedule event."""
+        self.summary.policy_events.append(event)

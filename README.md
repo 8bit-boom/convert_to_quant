@@ -91,7 +91,7 @@ ctq -i model.safetensors -o model-mxfp8mixed.safetensors --mxfp8 --comfy_quant -
 ctq -i model.safetensors -o model-auto.safetensors --auto-tune --num-iter 4000 --auto-tune-report tuning.json
 ```
 
-`--auto-tune` treats `--num-iter` as a firm per-layer budget. It probes learning rates around `--lr`, adapts decay and early stopping to each layer's shape and normalized loss trend, and may use one bounded recovery attempt. Without `--auto-tune`, all existing manual scheduler and early-stop arguments behave as before.
+`--auto-tune` treats `--num-iter` strictly as a maximum per-layer budget. It observes each layer's normalized loss trend for convergence and instability without replacing the selected scheduler or restarting the selected optimizer. Prodigy always starts at its required learning rate of `1.0`; `--lr` configures AdamW, RAdam, and Original. One bounded recovery attempt may be used after instability. Without `--auto-tune`, the existing manual scheduler and early-stop arguments remain available.
 
 ## Use In Code As Module
 

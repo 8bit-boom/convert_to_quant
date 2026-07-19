@@ -22,6 +22,8 @@ class _RetryConverter(BaseLearnedConverter):
         return self._run_selected_optimizer(W_orig)
 
     def _optimize_original(self, weight):
+        self.seen_schedules = getattr(self, "seen_schedules", [])
+        self.seen_schedules.append(self.lr_schedule)
         best = math.inf
         result = weight.clone()
         for iteration in range(self.num_iter):
@@ -47,23 +49,20 @@ def test_convergence_window_is_shape_aware_and_bounded():
 
 
 @pytest.mark.unit
-def test_controller_stops_a_quiet_plateau_after_lr_reductions():
+def test_controller_stops_a_quiet_plateau_without_owning_the_scheduler():
     controller = AdaptiveConvergenceController(
         shape=(16, 16), rank=16, optimizer="adamw", initial_lr=0.1, budget=128, kind="selected"
     )
     best = math.inf
-    lr = 0.1
     for _ in range(96):
         improved = controller.observe(1.0, best)
         if improved:
             best = 1.0
-        lr, _ = controller.update_lr(lr)
         if controller.should_stop:
             break
 
     assert controller.should_stop
     assert controller.summary.stop_reason == "converged_plateau"
-    assert controller.lr_reductions >= 1
     assert controller.summary.iterations < controller.summary.budget
 
 
@@ -95,6 +94,20 @@ def test_dispatch_uses_one_bounded_retry_and_keeps_it_inside_budget():
 
 
 @pytest.mark.unit
+def test_auto_tuning_preserves_the_selected_scheduler():
+    converter = _RetryConverter(
+        optimizer="original", num_iter=8, lr=0.1, lr_schedule="plateau", device="cpu", auto_tune=True
+    )
+
+    converter.convert(torch.zeros(4, 4), key="scheduler.weight")
+    record = converter.get_tuning_report()["layers"][0]
+
+    assert converter.seen_schedules == ["plateau"]
+    assert record["scheduler"] == "plateau"
+    assert converter.lr_schedule == "plateau"
+
+
+@pytest.mark.unit
 def test_tuning_report_collector_writes_versioned_json():
     report_path = Path("test_auto_tuning_collector.json")
     try:
@@ -102,7 +115,7 @@ def test_tuning_report_collector_writes_versioned_json():
         collector.add({"layer": "layer.weight", "stop_reason": "budget", "retried": False})
 
         payload = json.loads(report_path.read_text(encoding="utf-8"))
-        assert payload["version"] == 1
+        assert payload["version"] == 2
         assert payload["mode"] == "auto"
         assert payload["summary"]["layers"] == 1
         assert payload["layers"][0]["layer"] == "layer.weight"
@@ -139,8 +152,10 @@ def test_auto_tuning_respects_budget_restores_configuration_and_reports():
         assert scale.ndim == 0
         assert isinstance(extra, dict)
         assert record["iterations"] <= 96
-        assert len([attempt for attempt in record["attempts"] if attempt["kind"] == "probe"]) == 3
-        assert record["selected_lr"] in {0.025, 0.1, 0.4}
+        assert len([attempt for attempt in record["attempts"] if attempt["kind"] == "probe"]) == 0
+        assert record["selected_lr"] == 0.1
+        assert record["effective_initial_lr"] == 0.1
+        assert record["schedule_horizon"] == 2000
         assert record["best_loss"] is not None
         assert converter.num_iter == 96
         assert converter.lr == 0.1
@@ -173,6 +188,65 @@ def test_auto_tuning_runs_through_every_optimizer(optimizer):
     assert qdata.shape == weight.shape
     assert dequantized.shape == weight.shape
     assert converter.get_tuning_report()["summary"]["layers"] == 1
+    record = converter.get_tuning_report()["layers"][0]
+    assert record["attempts"][0]["kind"] == "selected"
+    assert not any(attempt["kind"] == "probe" for attempt in record["attempts"])
+    if optimizer == "prodigy":
+        assert converter.configured_lr == 0.1
+        assert converter.lr == 1.0
+        assert record["configured_lr"] == 0.1
+        assert record["effective_initial_lr"] == 1.0
+
+
+@pytest.mark.unit
+def test_auto_controller_captures_small_strict_improvements():
+    controller = AdaptiveConvergenceController(
+        shape=(16, 16), rank=16, optimizer="adamw", initial_lr=0.1, budget=64, kind="selected"
+    )
+
+    assert controller.observe(1.0, math.inf)
+    assert controller.observe(1.0 - 5e-7, 1.0)
+    assert controller.best_loss == pytest.approx(1.0 - 5e-7)
+
+
+@pytest.mark.unit
+def test_internal_schedule_clock_is_independent_of_maximum_budget():
+    short = _RetryConverter(optimizer="original", num_iter=500, lr=0.1, device="cpu")
+    long = _RetryConverter(optimizer="original", num_iter=8000, lr=0.1, device="cpu")
+
+    for iteration in (0, 50, 500, 1999, 2000, 4000):
+        assert short._optimization_schedule_progress(iteration) == long._optimization_schedule_progress(iteration)
+    assert short._optimization_schedule_interval(4) == long._optimization_schedule_interval(4) == 500
+
+
+@pytest.mark.unit
+def test_controller_trajectory_is_independent_of_maximum_budget():
+    short = AdaptiveConvergenceController(
+        shape=(16, 16), rank=16, optimizer="adamw", initial_lr=0.1, budget=64, kind="selected"
+    )
+    long = AdaptiveConvergenceController(
+        shape=(16, 16), rank=16, optimizer="adamw", initial_lr=0.1, budget=256, kind="selected"
+    )
+    for iteration in range(64):
+        loss = 1.0 if iteration < 40 else 0.9
+        short_improved = short.observe(loss, short.best_loss)
+        long_improved = long.observe(loss, long.best_loss)
+
+        assert short_improved == long_improved
+        assert short.should_stop == long.should_stop
+
+    assert short.losses == long.losses
+    assert short.summary.windows == long.summary.windows
+
+
+@pytest.mark.unit
+def test_prodigy_controller_does_not_stop_during_adaptation():
+    controller = AdaptiveConvergenceController(
+        shape=(8, 8), rank=8, optimizer="prodigy", initial_lr=1.0, budget=128, kind="selected"
+    )
+    for _ in range(49):
+        controller.observe(1.0, controller.best_loss)
+        assert not controller.should_stop
 
 
 @pytest.mark.integration
