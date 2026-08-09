@@ -174,6 +174,29 @@ class TestOutputDtype(unittest.TestCase):
             self.assertEqual(tensors[key].dtype, torch.float32)
         self.assertEqual(tensors[converted_key].dtype, torch.bfloat16)
 
+    def test_qwen_vlm_preserves_excluded_2d_weights_as_bfloat16(self):
+        tensors = {
+            "model.language_model.layers.34.attn.weight": torch.randn(2, 2, dtype=torch.float32),
+            "model.language_model.layers.35.attn.weight": torch.randn(2, 2, dtype=torch.float32),
+            "model.visual.blocks.23.attn.weight": torch.randn(2, 2, dtype=torch.float32),
+            "model.mtp.layers.2.attn.weight": torch.randn(2, 2, dtype=torch.float32),
+            "model.visual.patch_embed.proj.weight": torch.randn(2, 2, 2, 2, dtype=torch.float32),
+        }
+
+        cast_unquantized_weights(
+            tensors,
+            quantized_weight_keys=set(),
+            output_dtype="float16",
+            preserve_pattern=None,
+            filter_flags={"qwen_vlm": True},
+        )
+
+        self.assertEqual(tensors["model.language_model.layers.34.attn.weight"].dtype, torch.float16)
+        self.assertEqual(tensors["model.language_model.layers.35.attn.weight"].dtype, torch.bfloat16)
+        self.assertEqual(tensors["model.visual.blocks.23.attn.weight"].dtype, torch.bfloat16)
+        self.assertEqual(tensors["model.mtp.layers.2.attn.weight"].dtype, torch.bfloat16)
+        self.assertEqual(tensors["model.visual.patch_embed.proj.weight"].dtype, torch.float32)
+
 
 if __name__ == "__main__":
     unittest.main()

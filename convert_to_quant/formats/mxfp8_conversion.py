@@ -15,7 +15,7 @@ from typing import Dict, Optional
 import torch
 from safetensors.torch import save_file
 
-from ..constants import AVOID_KEY_NAMES, COMPUTE_DTYPE, MODEL_FILTERS, MXFP8_BLOCK_SIZE, NORMALIZE_SCALES_ENABLED
+from ..constants import AVOID_KEY_NAMES, COMPUTE_DTYPE, MXFP8_BLOCK_SIZE, NORMALIZE_SCALES_ENABLED, resolve_model_filter_patterns
 from ..converters.learned_mxfp8 import LearnedMXFP8Converter
 from ..converters.mxfp8_converter import MXFP8Converter
 from ..utils.comfy_quant import should_skip_layer_for_performance
@@ -114,14 +114,6 @@ def convert_to_mxfp8(
     # Use filter_flags dict passed from CLI (or empty if not provided)
     active_filters = filter_flags or {}
 
-    # Add patterns from active filters
-    for filter_name, is_active in active_filters.items():
-        if not is_active:
-            continue
-        cfg = MODEL_FILTERS[filter_name]
-        exclude_patterns.extend(cfg.get("exclude", []))
-        exclude_patterns.extend(cfg.get("highprec", []))
-
     # Compile --exclude-layers regex pattern
     exclude_regex_pattern = None
     if exclude_layers:
@@ -191,6 +183,8 @@ def convert_to_mxfp8(
         return
 
     all_keys = loader.keys()
+    for patterns in resolve_model_filter_patterns(active_filters, all_keys).values():
+        exclude_patterns.extend(patterns)
 
     # Read original file metadata to preserve during conversion
     original_metadata = loader.metadata()

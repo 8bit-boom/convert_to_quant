@@ -5,7 +5,7 @@ from typing import Dict, Iterable, Optional, Pattern, Union
 
 import torch
 
-from ..constants import MODEL_FILTERS
+from ..constants import get_model_filter_config, resolve_model_filter_patterns
 
 OUTPUT_DTYPES = {
     "bfloat16": torch.bfloat16,
@@ -49,6 +49,7 @@ def _mapped_preservation_dtype(
     key: str,
     source_dtype: torch.dtype,
     filter_flags: Optional[Dict[str, bool]],
+    resolved_filter_patterns: Dict[str, tuple],
 ) -> Optional[torch.dtype]:
     if not filter_flags:
         return None
@@ -57,11 +58,11 @@ def _mapped_preservation_dtype(
     for filter_name, enabled in filter_flags.items():
         if not enabled:
             continue
-        config = MODEL_FILTERS.get(filter_name)
-        if not config:
+        if filter_name not in resolved_filter_patterns:
             continue
+        config = get_model_filter_config(filter_name)
 
-        exclusion_patterns = config.get("exclude", []) + config.get("highprec", [])
+        exclusion_patterns = resolved_filter_patterns[filter_name]
         if not any(pattern in key for pattern in exclusion_patterns):
             continue
 
@@ -95,6 +96,7 @@ def cast_unquantized_weights(
     target_dtype = resolve_output_dtype(output_dtype)
     quantized_keys = set(quantized_weight_keys)
     cast_count = 0
+    resolved_filter_patterns = resolve_model_filter_patterns(filter_flags or {}, tensors.keys())
 
     for key, tensor in tensors.items():
         if not key.endswith(".weight") or key in quantized_keys or tensor.ndim != 2:
@@ -105,7 +107,9 @@ def cast_unquantized_weights(
         if preserve_pattern and preserve_pattern.search(key):
             requested_dtype = tensor.dtype
         else:
-            requested_dtype = _mapped_preservation_dtype(key, tensor.dtype, filter_flags) or target_dtype
+            requested_dtype = _mapped_preservation_dtype(
+                key, tensor.dtype, filter_flags, resolved_filter_patterns
+            ) or target_dtype
 
         if tensor.dtype != requested_dtype:
             tensors[key] = tensor.to(dtype=requested_dtype)

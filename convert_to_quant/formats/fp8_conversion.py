@@ -17,7 +17,7 @@ import torch
 from safetensors.torch import save_file
 
 from ..config.layer_config import get_layer_settings
-from ..constants import COMPUTE_DTYPE, FP8_MAX, FP8_MIN, INT8_SYMMETRIC_MAX, MODEL_FILTERS, NORMALIZE_SCALES_ENABLED, SCALE_DTYPE, T5XXL_REMOVE_KEY_NAMES, TARGET_FP8_DTYPE, TARGET_INT8_DTYPE
+from ..constants import COMPUTE_DTYPE, FP8_MAX, FP8_MIN, INT8_SYMMETRIC_MAX, NORMALIZE_SCALES_ENABLED, SCALE_DTYPE, T5XXL_REMOVE_KEY_NAMES, TARGET_FP8_DTYPE, TARGET_INT8_DTYPE, resolve_model_filter_patterns
 from ..converters.learned_mxfp8 import LearnedMXFP8Converter
 from ..converters.learned_nvfp4 import LearnedNVFP4Converter
 from ..converters.learned_rounding import LearnedRoundingConverter
@@ -152,6 +152,7 @@ def convert_to_fp8_scaled(
         return
 
     all_keys = loader.keys()
+    resolved_filter_patterns = resolve_model_filter_patterns(filter_flags, all_keys)
 
     # Read original file metadata to preserve during conversion
     original_metadata = loader.metadata()
@@ -387,17 +388,7 @@ def convert_to_fp8_scaled(
         # Check exclusion filters (only matters if not custom matched and not layer_config matched)
         # Uses MODEL_FILTERS registry for centralized filter definitions
         if not use_custom and not use_layer_config:
-            # Use filter_flags dict passed from CLI
-            active_filters = filter_flags
-
-            # Check each active filter against the key
-            for filter_name, is_active in active_filters.items():
-                if not is_active:
-                    continue
-                cfg = MODEL_FILTERS[filter_name]
-
-                # Both "exclude" and "highprec" mean the same thing: skip quantization
-                skip_patterns = cfg.get("exclude", []) + cfg.get("highprec", [])
+            for filter_name, skip_patterns in resolved_filter_patterns.items():
                 if skip_patterns and any(n in key for n in skip_patterns):
                     exclusion_reason = f"{filter_name} skip"
                     break

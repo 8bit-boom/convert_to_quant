@@ -98,7 +98,7 @@ def extract_filter_flags(args) -> dict:
             flags[name] = True
 
     # Text model aliases: these flags imply generic_text input_scale behavior
-    TEXT_MODEL_ALIASES = {"qwen35"}
+    TEXT_MODEL_ALIASES = {"qwen35", "qwen_vlm"}
     if any(flags.get(alias) for alias in TEXT_MODEL_ALIASES):
         flags["generic_text"] = True
 
