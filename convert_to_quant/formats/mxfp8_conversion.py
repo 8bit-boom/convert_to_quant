@@ -10,41 +10,19 @@ Use --simple to switch to raw MXFP8Converter.
 
 import gc
 import os
-from typing import (
-    Dict,
-    Optional,
-)
+from typing import Dict, Optional
 
 import torch
 from safetensors.torch import save_file
 
-from ..constants import (
-    AVOID_KEY_NAMES,
-    COMPUTE_DTYPE,
-    MODEL_FILTERS,
-    MXFP8_BLOCK_SIZE,
-    NORMALIZE_SCALES_ENABLED,
-)
+from ..constants import AVOID_KEY_NAMES, COMPUTE_DTYPE, MODEL_FILTERS, MXFP8_BLOCK_SIZE, NORMALIZE_SCALES_ENABLED
 from ..converters.learned_mxfp8 import LearnedMXFP8Converter
 from ..converters.mxfp8_converter import MXFP8Converter
-from ..utils.comfy_quant import (
-    should_skip_layer_for_performance,
-)
-from ..utils.logging import (
-    error,
-    info,
-    log_debug,
-    minimal,
-    verbose,
-    warning,
-)
-from ..utils.memory_efficient_loader import (
-    UnifiedSafetensorsLoader,
-)
-from ..utils.tensor_utils import (
-    dict_to_tensor,
-    normalize_tensorwise_scales,
-)
+from ..utils.comfy_quant import should_skip_layer_for_performance
+from ..utils.logging import error, info, log_debug, minimal, verbose, warning
+from ..utils.memory_efficient_loader import UnifiedSafetensorsLoader
+from ..utils.output_dtype import cast_unquantized_weights, compile_preserve_layers, resolve_output_dtype
+from ..utils.tensor_utils import dict_to_tensor, normalize_tensorwise_scales
 
 
 @log_debug
@@ -100,6 +78,8 @@ def convert_to_mxfp8(
     lora_save_path: Optional[str] = None,
     # Added for CLI compatibility
     lora_output: Optional[str] = None,
+    output_dtype: str = "bfloat16",
+    preserve_layers: Optional[str] = None,
 ) -> None:
     """
     Convert safetensors model to MXFP8 (Microscaling FP8) quantized format.
@@ -114,6 +94,14 @@ def convert_to_mxfp8(
     info("Target format: MXFP8 (Microscaling FP8 block quantization)")
     info(f"Block size: {MXFP8_BLOCK_SIZE}")
     info("-" * 60)
+
+    try:
+        resolved_output_dtype = resolve_output_dtype(output_dtype)
+        preserve_pattern = compile_preserve_layers(preserve_layers)
+    except ValueError as exc:
+        error(f"ERROR: {exc}")
+        return
+    quantized_orig_dtype = str(resolved_output_dtype)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     seed_device = "cpu"
@@ -193,6 +181,7 @@ def convert_to_mxfp8(
     quant_metadata = {}
     quantized_count = 0
     skipped_count = 0
+    quantized_weight_keys = set()
 
     # Load tensors using unified loader (handles both standard and low-memory modes)
     try:
@@ -310,6 +299,7 @@ def convert_to_mxfp8(
 
         # Store quantized data and scales (move to CPU for saving)
         output_tensors[key] = qdata.cpu()  # FP8 E4M3
+        quantized_weight_keys.add(key)
 
         # block_scales -> weight_scale (E8M0 stored as uint8, matching MXFP8 format)
         # Note: MXFP8 has only one scale tensor (no weight_scale_2 like NVFP4)
@@ -349,7 +339,7 @@ def convert_to_mxfp8(
         metadata = {
             "format": "mxfp8",
             "group_size": MXFP8_BLOCK_SIZE,
-            "orig_dtype": str(tensor.dtype),
+            "orig_dtype": quantized_orig_dtype,
             "orig_shape": list(tensor.shape)
         }
         output_tensors[f"{base_key}.comfy_quant"] = dict_to_tensor(metadata)
@@ -372,6 +362,16 @@ def convert_to_mxfp8(
     for key in all_keys:
         if key not in output_tensors:
             output_tensors[key] = loader.get_tensor(key)
+
+    cast_count = cast_unquantized_weights(
+        output_tensors,
+        quantized_weight_keys,
+        resolved_output_dtype,
+        preserve_pattern,
+        active_filters,
+    )
+    if cast_count:
+        info(f"Converted {cast_count} unquantized 2D weight tensors to the output dtype policy")
 
     # Close loader
     loader.close()

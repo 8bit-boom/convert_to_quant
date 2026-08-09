@@ -199,7 +199,12 @@ MODEL_FILTERS = {
     "krea2": {
         "help": "Krea2: keep firs, las, tml, txtfusion, last.modulation, tpro layers high-precision",
         "category": "diffusion",
-        "highprec": KREA2_LAYER_KEYNAMES
+        "highprec": KREA2_LAYER_KEYNAMES,
+        "preserve_dtype": {
+            "float32": [
+                r"(?:^|\.)(?:first|last\.linear|tmlp\.(?:0|2)|tproj\.1|txtfusion\.projector|txtmlp\.(?:1|3))\.weight$"
+            ]
+        },
     },
     "ideogram4": {
         "help": "Ideogram4: keep embed_image_indicator, t_embedding, adaln_proj, final_layer, input_proj layers high-precision",
