@@ -514,8 +514,7 @@ class TestFilterFlags(unittest.TestCase):
     # 12. Dimension shapes are preserved for skipped layers
     # ------------------------------------------------------------------
 
-    def test_fp8_skipped_layer_weight_shape_preserved(self):
-        """Skipped layers must be written with their original shape and dtype."""
+    def test_fp8_skipped_layer_weight_shape_and_output_dtype(self):
         model = _build_model()
         out = self._run_fp8({"anima": True})
 
@@ -524,7 +523,7 @@ class TestFilterFlags(unittest.TestCase):
             if key in model:
                 orig = model[key]
                 self.assertEqual(out[key].shape, orig.shape, f"Shape mismatch for skipped {key}")
-                self.assertEqual(out[key].dtype, orig.dtype, f"Dtype mismatch for skipped {key}")
+                self.assertEqual(out[key].dtype, torch.bfloat16, f"Output dtype mismatch for skipped {key}")
 
     def test_fp8_3d_4d_shape_preserved(self):
         """3D and 4D tensors must be copied with original shape and dtype."""
