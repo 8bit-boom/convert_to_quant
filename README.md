@@ -117,13 +117,14 @@ Load the output `.safetensors` file in ComfyUI like any other model.
 
 | Format | CLI Flag | Hardware | Optimization |
 |--------|----------|----------|--------------|
-| **FP8 (E4M3)** | *(default)* | Ada/Hopper+ | Learned Rounding (SVD) |
-| **INT8 Block-wise**| `--int8` | Any GPU | Learned Rounding (SVD) |
-| **INT8 Tensor-wise**| `--int8 --scaling_mode tensor` | Any GPU | High-perf `_scaled_mm` |
-| **NVFP4 (4-bit)** | `--nvfp4` | Blackwell | Dual-scale optimization |
-| **MXFP8** | `--mxfp8` | Blackwell | Microscaling (E8M0) |
+| **FP8 (E4M3)** | *(default)* | Ada/Hopper+ |
+| **INT8 Block-wise**| `--int8` | Datacenter GPU |
+| **INT8 ConvRot**| `--int8 --scaling_mode row --convrot --convrot-group-size 256` | Any GPU |
+| **INT8 Row-wise**| `--int8 --scaling_mode row` | Any GPU |
+| **INT8 Tensor-wise**| `--int8 --scaling_mode tensor` | Any GPU |
+| **NVFP4 (4-bit)** | `--nvfp4` | Blackwell |
+| **MXFP8** | `--mxfp8` | Blackwell |
 
-For a deep dive into how these formats work, see **[FORMATS.md](docs/FORMATS.md)**.
 
 ---
 
