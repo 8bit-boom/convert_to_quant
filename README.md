@@ -136,6 +136,7 @@ Load the output `.safetensors` file in ComfyUI like any other model.
 | T5-XXL | `--t5xxl` | Decoder removed |
 | Hunyuan Video| `--hunyuan`| Attention norms excluded |
 | WAN Video | `--wan` | Time embeddings excluded |
+| MiniMax H3 | `--minimaxh3` | Patch, conditioning, final, time, and token-refiner layers kept high-precision |
 
 *(See `--help-filters` for a full list of presets)*
 

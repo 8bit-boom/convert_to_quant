@@ -114,6 +114,9 @@ BOOGU_LAYER_KEYNAMES = [
     "norm_out.linear_2"
 ]
 IDEOGRAM4_LAYER_KEYNAMES = ["embed_image_indicator", "t_embedding", "llm_cond_proj", "adaln_proj", "final_layer", "input_proj"]
+MINIMAXH3_LAYER_KEYNAMES = [
+    "audio_patch_proj", "condition_proj", "final_layer", "time_embedder", "token_refiner", "video_patch_proj"
+]
 
 # --- Model Filter Registry ---
 # Each entry maps a CLI flag (--radiance, --flux2, etc.) to its layer patterns.
@@ -233,6 +236,11 @@ MODEL_FILTERS = {
         "help": "Hunyuan Video 1.5: skip layernorm, attn norms, vision_in",
         "category": "video",
         "exclude": HUNYUAN_AVOID_KEY_NAMES
+    },
+    "minimaxh3": {
+        "help": "MiniMax H3: keep patch/condition/final/time and token-refiner layers high-precision",
+        "category": "video",
+        "highprec": MINIMAXH3_LAYER_KEYNAMES
     },
     # Image Models
     "qwen": {
