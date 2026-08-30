@@ -125,6 +125,24 @@ Load the output `.safetensors` file in ComfyUI like any other model.
 | **NVFP4 (4-bit)** | `--nvfp4` | Blackwell |
 | **MXFP8** | `--mxfp8` | Blackwell |
 
+### INT8 ConvRot
+
+Learned/AdaRound row-wise INT8 ConvRot:
+
+```bash
+ctq -i model.safetensors -o model-int8-convrot.safetensors --comfy_quant --save-quant-metadata --int8 --scaling-mode row --convrot --convrot-group-size 256
+```
+
+Add `--simple` to use direct row-wise INT8 quantization without learned/AdaRound optimization:
+
+```bash
+ctq -i model.safetensors -o model-int8-convrot-simple.safetensors --comfy_quant --save-quant-metadata --int8 --scaling-mode row --convrot --convrot-group-size 256 --simple
+```
+
+Group 256 remains the default when it divides the layer input width. Primary
+INT8 ConvRot layers otherwise use regular group 64 when compatible, including
+widths such as 2688.
+
 
 ---
 
