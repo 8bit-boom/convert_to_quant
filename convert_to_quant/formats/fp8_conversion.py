@@ -26,6 +26,12 @@ from ..utils.logging import error, info, log_debug, minimal, verbose, warning
 from ..utils.memory_efficient_loader import MemoryEfficientSafeOpen
 from ..utils.output_dtype import cast_unquantized_weights, compile_preserve_layers, resolve_output_dtype
 from ..utils.tensor_utils import normalize_tensorwise_scales
+from ..checkpoint import (
+    StopRequested,
+    TensorCheckpoint,
+    restore_stop_signal_handlers,
+    should_stop,
+)
 
 
 @log_debug
@@ -75,6 +81,9 @@ def convert_to_fp8_scaled(
     lora_output: Optional[str] = None,
     output_dtype: str = "bfloat16",
     preserve_layers: Optional[str] = None,
+    # Checkpoint / stop-and-resume
+    checkpoint_dir: Optional[str] = None,
+    stop_file: Optional[str] = None,
     **converter_kwargs,
 ):
     # Ensure filter_flags is a dict
@@ -113,6 +122,21 @@ def convert_to_fp8_scaled(
     else:
         info(f"Target FP8 format: {TARGET_FP8_DTYPE}\nFP8 Range: [{FP8_MIN}, {FP8_MAX}]")
     info("-" * 60)
+
+    # Checkpoint / resume setup. Must happen before the seed generator is
+    # created below so a resumed run reproduces identical calibration data.
+    checkpoint = None
+    if checkpoint_dir:
+        from ..checkpoint import install_stop_signal_handlers
+
+        install_stop_signal_handlers()
+        if TensorCheckpoint.exists(checkpoint_dir):
+            checkpoint = TensorCheckpoint.open(checkpoint_dir)
+            seed = checkpoint.seed
+            info(
+                f"Resuming from checkpoint: {checkpoint.completed_count}/{checkpoint.total} "
+                f"tensors already done (restored seed={seed})"
+            )
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -350,7 +374,61 @@ def convert_to_fp8_scaled(
     info(f"Found {total_weights} weight tensors to potentially process.")
     info("-" * 60)
 
+    if checkpoint_dir:
+        if checkpoint is None:
+            checkpoint = TensorCheckpoint.create(
+                checkpoint_dir,
+                input_file=input_file,
+                seed=seed,
+                target_format=target_format,
+                weight_keys=weight_keys,
+            )
+            info(f"Checkpointing progress to: {checkpoint_dir}")
+        else:
+            checkpoint.validate_for(
+                input_file=input_file, target_format=target_format, weight_keys=weight_keys
+            )
+
+    # Restore mid-run accumulators BEFORE the loop so subsequent record()
+    # calls persist the merged (old + new) state instead of overwriting it.
+    if checkpoint is not None and checkpoint.completed_count:
+        st = checkpoint.state
+        if quant_metadata_layers is not None and st.get("quant_metadata_layers"):
+            quant_metadata_layers.update(st["quant_metadata_layers"])
+        quantized_weight_keys.update(st.get("quantized_weight_keys", []))
+
+    # Tracks which new_tensors entries have been persisted to the checkpoint
+    # so each weight key records exactly the entries it added (weight plus
+    # scale / comfy_quant / bias companions), however the iteration ended.
+    _recorded_keys: set = set()
+
+    def _checkpoint_record(k: str) -> None:
+        added = {nk: t for nk, t in new_tensors.items() if nk not in _recorded_keys}
+        _recorded_keys.update(added.keys())
+        checkpoint.record(
+            k,
+            added,
+            state={
+                "quant_metadata_layers": quant_metadata_layers,
+                "quantized_weight_keys": sorted(quantized_weight_keys),
+            },
+        )
+
     for i, key in enumerate(weight_keys):
+        if checkpoint is not None:
+            if checkpoint.is_done(key):
+                continue
+            if should_stop(stop_file):
+                info(
+                    f"Stop requested — {checkpoint.completed_count}/{total_weights} tensors "
+                    f"saved to checkpoint. Re-run the same command to resume."
+                )
+                loader.close()
+                if calib_cache_dir and os.path.exists(calib_cache_dir):
+                    shutil.rmtree(calib_cache_dir)
+                restore_stop_signal_handlers()
+                raise StopRequested()
+
         exclusion_reason = ""
         use_custom = False
         use_fallback = False
@@ -366,6 +444,8 @@ def convert_to_fp8_scaled(
         # T5XXL decoder tensors are always removed (not quantized, not kept)
         if filter_flags.get("t5xxl") and any(n in key for n in T5XXL_REMOVE_KEY_NAMES):
             info(f"({i + 1}/{total_weights}) Removing T5XXL decoder tensor: {key}")
+            if checkpoint is not None:
+                _checkpoint_record(key)
             skipped_count += 1
             continue
 
@@ -378,6 +458,8 @@ def convert_to_fp8_scaled(
                     original_tensor = loader.get_tensor(key)
                     new_tensors[key] = original_tensor.to(device="cpu", dtype=original_tensor.dtype)
                     loader.mark_processed(key)
+                    if checkpoint is not None:
+                        _checkpoint_record(key)
                     skipped_count += 1
                     continue
                 use_layer_config = True
@@ -418,6 +500,8 @@ def convert_to_fp8_scaled(
                 original_tensor = loader.get_tensor(key)
                 new_tensors[key] = original_tensor.to(device="cpu", dtype=original_tensor.dtype)
                 loader.mark_processed(key)
+                if checkpoint is not None:
+                    _checkpoint_record(key)
                 skipped_count += 1
                 continue
 
@@ -440,6 +524,8 @@ def convert_to_fp8_scaled(
         if original_tensor.numel() == 0 or original_tensor.ndim != 2:
             info(f"  - Skipping empty or non-2D tensor: {key}")
             new_tensors[key] = original_tensor.to(device="cpu", dtype=original_tensor.dtype)
+            if checkpoint is not None:
+                _checkpoint_record(key)
             continue
 
         # Check performance heuristics for inefficient layers
@@ -451,6 +537,8 @@ def convert_to_fp8_scaled(
                 info(f"  - Skipping for performance: {skip_perf_reason}")
                 new_tensors[key] = original_tensor.to(device="cpu", dtype=original_tensor.dtype)
                 loader.mark_processed(key)
+                if checkpoint is not None:
+                    _checkpoint_record(key)
                 skipped_count += 1
                 continue
 
@@ -827,6 +915,15 @@ def convert_to_fp8_scaled(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        if checkpoint is not None:
+            _checkpoint_record(key)
+
+    if checkpoint is not None and checkpoint.completed_count:
+        replayed = checkpoint.load_all()
+        new_tensors.update(replayed)
+        _recorded_keys.update(replayed.keys())
+        info(f"Replayed {checkpoint.completed_count} checkpointed tensors ({len(replayed)} entries).")
+
     # Copy remaining tensors (bias, norms, etc.)
     for key in all_keys:
         if any(n in key for n in T5XXL_REMOVE_KEY_NAMES) and filter_flags.get("t5xxl"):
@@ -893,6 +990,10 @@ def convert_to_fp8_scaled(
         if calib_cache_dir and os.path.exists(calib_cache_dir):
             shutil.rmtree(calib_cache_dir)
         return
+
+    if checkpoint is not None:
+        checkpoint.mark_finished()
+        restore_stop_signal_handlers()
 
     if calib_cache_dir and os.path.exists(calib_cache_dir):
         shutil.rmtree(calib_cache_dir)

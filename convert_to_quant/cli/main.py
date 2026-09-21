@@ -20,6 +20,7 @@ from ..config.layer_config import (
     generate_config_template,
     load_layer_config,
 )
+from ..checkpoint import EXIT_STOPPED, StopRequested
 from ..constants import (
     MODEL_FILTERS,
     TARGET_FP8_DTYPE,
@@ -525,6 +526,18 @@ In JSON, backslashes must be doubled (\\\\. for literal dot). See DEVELOPMENT.md
     parser.add_argument(
         "--low-memory", "--low_memory", "-lm", action="store_true", dest="low_memory",
         help="Use streaming tensor loading to reduce RAM usage (recommended for models >50%% of available RAM)"
+    )
+
+    # Checkpoint / stop-and-resume
+    parser.add_argument(
+        "--checkpoint-dir", "--checkpoint_dir", type=str, default=None, dest="checkpoint_dir",
+        help="Directory for a resumable checkpoint. Stop the run (SIGINT/SIGTERM or --stop-file) and "
+        "re-run the same command to continue from the last completed tensor."
+    )
+    parser.add_argument(
+        "--stop-file", "--stop_file", type=str, default=None, dest="stop_file",
+        help="Path polled between tensors when --checkpoint-dir is active: creating this file requests "
+        "a clean stop (exit code 3) with progress saved to the checkpoint."
     )
 
     return parser
@@ -1121,13 +1134,23 @@ def run_conversion(args):
         lora_depth=args.lora_depth,
         lora_ar_threshold=args.lora_ar_threshold,
         lora_output=args.lora_output,
+        # Checkpoint / stop-and-resume
+        checkpoint_dir=args.checkpoint_dir,
+        stop_file=args.stop_file,
     )
 
 
 def main():
     parser = get_parser()
     args = parser.parse_args()
-    run_conversion(args)
+    try:
+        run_conversion(args)
+    except StopRequested:
+        print(
+            f"\nConversion stopped — checkpoint saved. "
+            f"Re-run the same command to resume (exit code {EXIT_STOPPED})."
+        )
+        sys.exit(EXIT_STOPPED)
 
 
 if __name__ == "__main__":
