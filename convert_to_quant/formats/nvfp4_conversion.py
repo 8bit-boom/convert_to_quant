@@ -19,6 +19,7 @@ from ..constants import AVOID_KEY_NAMES, COMPUTE_DTYPE, FP4_BLOCK_SIZE, NORMALIZ
 from ..converters.learned_nvfp4 import LearnedNVFP4Converter
 from ..converters.nvfp4_converter import NVFP4Converter
 from ..utils.comfy_quant import should_skip_layer_for_performance
+from ..utils.debounced_gc import default_gc_debouncer
 from ..utils.logging import error, info, log_debug, minimal, verbose, warning
 from ..utils.memory_efficient_loader import UnifiedSafetensorsLoader
 from ..utils.output_dtype import cast_unquantized_weights, compile_preserve_layers, resolve_output_dtype
@@ -54,6 +55,11 @@ def convert_to_nvfp4(
     min_k: int = 128,
     max_k: int = 1280,
     full_matrix: bool = False,
+    svd_niter: int = 4,
+    fast_math: bool = False,
+    snapshot_interval: int = 1,
+    loss_sync_batch: int = 1,
+    compile_loop: bool = False,
     # LR schedule tuning
     lr_gamma: float = 0.99,
     lr_patience: int = 1,
@@ -167,6 +173,11 @@ def convert_to_nvfp4(
             block_size=FP4_BLOCK_SIZE,
             pad_to_16x=True,
             full_matrix=full_matrix,
+            svd_niter=svd_niter,
+            fast_math=fast_math,
+            snapshot_interval=snapshot_interval,
+            loss_sync_batch=loss_sync_batch,
+            compile_loop=compile_loop,
             no_learned_rounding=False,
             lr_schedule=lr_schedule,
             lr_gamma=lr_gamma,
@@ -440,9 +451,7 @@ def convert_to_nvfp4(
 
         # Cleanup
         del tensor, dequant_w
-        gc.collect()
-        if device == "cuda":
-            torch.cuda.empty_cache()
+        default_gc_debouncer.maybe_collect()
 
         if checkpoint is not None:
             _checkpoint_record(key)

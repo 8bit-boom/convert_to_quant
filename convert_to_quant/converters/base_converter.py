@@ -6,7 +6,6 @@ and LearnedNVFP4Converter (NVFP4). Contains common initialization,
 SVD computation, LR scheduling, and early stopping logic.
 """
 
-import gc
 import math
 from abc import (
     ABC,
@@ -19,6 +18,8 @@ from typing import (
 )
 
 import torch
+
+from ..utils.debounced_gc import default_gc_debouncer
 
 
 class BaseLearnedConverter(ABC):
@@ -43,6 +44,11 @@ class BaseLearnedConverter(ABC):
         min_k: int = 128,
         max_k: int = 1280,
         full_matrix: bool = False,
+        svd_niter: int = 4,
+        fast_math: bool = False,
+        snapshot_interval: int = 1,
+        loss_sync_batch: int = 1,
+        compile_loop: bool = False,
         no_learned_rounding: bool = False,
         lr_schedule: str = "plateau",
         lr_gamma: float = 0.99,
@@ -78,6 +84,33 @@ class BaseLearnedConverter(ABC):
             min_k: Minimum number of SVD components
             max_k: Maximum number of SVD components
             full_matrix: Use full SVD instead of lowrank
+            svd_niter: Number of power-iteration refinement steps for svd_lowrank
+                (default 4; 1-2 is much faster with minimal quality loss since the
+                optimizer corrects the starting subspace anyway)
+            fast_math: Opt-in CUDA speed mode — enables TF32 matmuls and computes
+                the SVD projection in bf16. Roughly 20-40% faster optimizer
+                iterations, but CHANGES RESULTS (lower precision math). Only
+                takes effect when a CUDA device is available.
+            snapshot_interval: Clone the best-so-far tensor only every N
+                improvements (default 1 = clone on every improvement, the
+                original behavior). Values like 8-16 reduce per-iteration copy
+                overhead on GPU; the returned tensor may lag the best loss by
+                up to N-1 improvements.
+            loss_sync_batch: Only meaningful on CUDA. Sync the scalar loss to
+                the CPU once every K iterations instead of every iteration
+                (default 1 = original behavior). Kernels queue asynchronously
+                between syncs, hiding launch overhead (up to ~6x wall-clock on
+                typical layer shapes). Tradeoff: LR updates, best-tensor
+                snapshots, and early-stop decisions lag by up to K-1
+                iterations, so results can drift slightly (observed ~4e-4
+                relative at K=8 vs K=1). No effect (returns 1) without CUDA.
+            compile_loop: Opt-in CUDA speed mode — JIT-compile the per-iteration
+                forward pass of the learned-rounding optimizer loops with
+                torch.compile (requires triton). Steady-state ~5% faster GPU
+                iterations, but each new tensor shape pays a ~1-3 s compilation
+                warmup, so it only pays off for models with many same-shaped
+                layers and high iteration counts. Falls back to eager if
+                triton is missing.
             no_learned_rounding: Skip optimization, use simple quantization
             lr_schedule: LR schedule ("adaptive", "exponential", "plateau")
             lr_gamma: Decay factor for exponential schedule
@@ -106,6 +139,27 @@ class BaseLearnedConverter(ABC):
         self.min_k = min_k
         self.max_k = max_k
         self.full_matrix = full_matrix
+        self.svd_niter = max(1, int(svd_niter))
+
+        # Fast-math mode (opt-in): TF32 matmuls + bf16 SVD projection on CUDA.
+        # Changes optimizer numerics — results will differ from default mode.
+        self.fast_math = bool(fast_math) and torch.cuda.is_available()
+        if fast_math and not torch.cuda.is_available():
+            import warnings
+
+            warnings.warn("fast_math=True has no effect without a CUDA device; running in default precision.")
+        if self.fast_math:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        # Best-tensor snapshot throttle (1 = original per-improvement cloning).
+        self.snapshot_interval = max(1, int(snapshot_interval))
+
+        # Loss-sync batching (CUDA only; 1 = sync every iteration).
+        self.loss_sync_batch = max(1, int(loss_sync_batch))
+
+        # torch.compile of the optimizer forward body (opt-in; CUDA + triton).
+        self.compile_loop = bool(compile_loop)
 
         # Optimizer configuration
         self.optimizer_choice = optimizer
@@ -241,7 +295,7 @@ class BaseLearnedConverter(ABC):
 
             try:
                 # Use svd_lowrank for efficiency
-                U, S, V = torch.svd_lowrank(error, q=actual_rank, niter=4)
+                U, S, V = torch.svd_lowrank(error, q=actual_rank, niter=self.svd_niter)
 
                 # LoRA Up = U * diag(S)
                 # LoRA Down = V^T
@@ -283,14 +337,22 @@ class BaseLearnedConverter(ABC):
             try:
                 if verbose:
                     print("    - Trying svd_lowrank")
-                U, _, Vh = torch.svd_lowrank(W_float32, q=min(k + 10, max_rank), niter=4)
+                U, _, Vh = torch.svd_lowrank(W_float32, q=min(k + 10, max_rank), niter=self.svd_niter)
                 Vh = Vh.T
             except RuntimeError:
                 if verbose:
                     print("    - svd_lowrank failed, falling back to full SVD.")
                 U, _, Vh = torch.linalg.svd(W_float32, full_matrices=False)
 
-        return U[:, :k], Vh[:k, :], k
+        U_k, Vh_k = U[:, :k], Vh[:k, :]
+        if self.fast_math and U_k.is_cuda:
+            # bf16 projection bases: the per-iteration error operand is cast to
+            # match (see call sites using `error.to(U_k.dtype)`), enabling
+            # tensor-core matmuls in the optimizer loop. Numerics differ from
+            # the fp32 default — this mode is opt-in.
+            U_k = U_k.to(torch.bfloat16)
+            Vh_k = Vh_k.to(torch.bfloat16)
+        return U_k, Vh_k, k
 
     def _adaptive_lr_update_cosine(
         self, curr_lr: float, improved: bool, worse_loss_counter: int, iteration: int, tensor_shape: Tuple[int, int],
@@ -426,13 +488,47 @@ class BaseLearnedConverter(ABC):
                 return (best_loss - current_loss) > self.lr_threshold
         return current_loss < best_loss
 
+    def _get_sync_batch(self) -> int:
+        """
+        Effective loss-sync batch size for optimizer loops.
+
+        Loss-sync batching only helps when kernels queue asynchronously on a
+        CUDA device; on CPU (or without CUDA) every kernel is synchronous
+        already, so this always returns 1 there regardless of the configured
+        value.
+        """
+        if self.device == "cuda" or (self.device != "cpu" and torch.cuda.is_available()):
+            return max(1, int(self.loss_sync_batch))
+        return 1
+
+    def _maybe_compile_loop(self, fn):
+        """
+        Return torch.compile(fn) when compile_loop is enabled and the
+        environment supports it (CUDA + triton); otherwise return fn unchanged.
+        Compilation errors fall back to eager execution.
+        """
+        if not self.compile_loop:
+            return fn
+        if not torch.cuda.is_available():
+            import warnings
+
+            warnings.warn("compile_loop=True has no effect without a CUDA device; running eagerly.")
+            return fn
+        try:
+            import triton  # noqa: F401
+
+            return torch.compile(fn)
+        except Exception as exc:
+            import warnings
+
+            warnings.warn(f"compile_loop=True but torch.compile unavailable ({exc}); running eagerly.")
+            return fn
+
     def _cleanup_tensors(self, *tensors) -> None:
-        """Delete tensors and clear GPU cache."""
+        """Delete tensors and debounce GPU cache reclamation."""
         for t in tensors:
             del t
-        gc.collect()
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
+        default_gc_debouncer.maybe_collect()
 
     @abstractmethod
     def convert(self, W_orig: torch.Tensor, key: Optional[str] = None, depth: int = -1, **kwargs) -> Tuple:

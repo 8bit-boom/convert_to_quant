@@ -30,6 +30,8 @@ from ..constants import (
     TARGET_INT8_DTYPE,
 )
 from ..pinned_transfer import transfer_to_gpu_pinned
+from ..utils.debounced_gc import default_gc_debouncer
+from ..utils.progress import set_postfix_throttled
 from ..utils.logging import (
     debug,
     info,
@@ -173,26 +175,18 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             W_float32.shape[0], W_float32.shape[1]
         )
 
-        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing (AdamW-{schedule_name})", leave=False, dynamic_ncols=True)
-        for i in pbar:
-            optimizer.zero_grad()
-            W_q_refined = W_rounded + delta
+        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing (AdamW-{schedule_name})", leave=False, dynamic_ncols=True, mininterval=0.5)
 
-            current_dq = W_q_refined / scale
-            error = current_dq - W_float32
-            projected_error = U_k.T @ error @ Vh_k.T
-            loss = torch.linalg.norm(projected_error)
-
-            loss.backward()
-            optimizer.step()
-
-            current_loss_val = loss.item()
+        def _process_iteration(i: int, current_loss_val: float) -> bool:
+            """Scalar bookkeeping for one iteration. Returns True to stop early."""
+            nonlocal best_loss, best_delta, worse_loss_counter, plateau_counter, cooldown_counter, curr_lr
             prev_worse_counter = worse_loss_counter
             improved = self._check_improvement(current_loss_val, best_loss)
 
             if improved:
                 best_loss = current_loss_val
-                best_delta = delta.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_delta = delta.detach().clone()
                 plateau_counter = 0
                 if self.lr_adaptive_mode == "simple-reset":
                     worse_loss_counter = 0
@@ -239,7 +233,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             # Schedule-appropriate postfix: show plateau counter or worse counter
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -248,7 +242,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -265,7 +259,42 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     info("\n      - Loss has stalled. Stopping early.")
                 elif best_loss <= self.early_stop_loss:
                     info("\n      - Loss is negligible. Stopping early.")
-                break
+                return True
+            return False
+
+        def _forward():
+            W_q_refined = W_rounded + delta
+            current_dq = W_q_refined / scale
+            error = current_dq - W_float32
+            projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
+            return torch.linalg.norm(projected_error)
+
+        forward_fn = self._maybe_compile_loop(_forward)
+
+        sync_batch = self._get_sync_batch()
+        pending_losses: list = []
+        for i in pbar:
+            optimizer.zero_grad()
+            loss = forward_fn()
+
+            loss.backward()
+            optimizer.step()
+
+            if sync_batch <= 1:
+                if _process_iteration(i, loss.item()):
+                    break
+            else:
+                pending_losses.append(loss.detach())
+                if len(pending_losses) >= sync_batch or i == self.num_iter - 1:
+                    replay_vals = torch.stack(pending_losses).tolist()
+                    pending_losses = []
+                    stop = False
+                    for offset, val in enumerate(replay_vals):
+                        if _process_iteration(i - len(replay_vals) + offset + 1, val):
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         pbar.close()
         return W_rounded + best_delta
@@ -296,26 +325,18 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             W_float32.shape[0], W_float32.shape[1]
         )
 
-        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing (RAdam-{schedule_name})", leave=False, dynamic_ncols=True)
-        for i in pbar:
-            optimizer.zero_grad()
-            W_q_refined = W_rounded + delta
+        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing (RAdam-{schedule_name})", leave=False, dynamic_ncols=True, mininterval=0.5)
 
-            current_dq = W_q_refined / scale
-            error = current_dq - W_float32
-            projected_error = U_k.T @ error @ Vh_k.T
-            loss = torch.linalg.norm(projected_error)
-
-            loss.backward()
-            optimizer.step()
-
-            current_loss_val = loss.item()
+        def _process_iteration(i: int, current_loss_val: float) -> bool:
+            """Scalar bookkeeping for one iteration. Returns True to stop early."""
+            nonlocal best_loss, best_delta, worse_loss_counter, plateau_counter, cooldown_counter, curr_lr
             prev_worse_counter = worse_loss_counter
             improved = self._check_improvement(current_loss_val, best_loss)
 
             if improved:
                 best_loss = current_loss_val
-                best_delta = delta.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_delta = delta.detach().clone()
                 plateau_counter = 0
                 if self.lr_adaptive_mode == "simple-reset":
                     worse_loss_counter = 0
@@ -362,7 +383,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             # Schedule-appropriate postfix: show plateau counter or worse counter
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -371,7 +392,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -388,7 +409,42 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     info("\n      - Loss has stalled. Stopping early.")
                 elif best_loss <= self.early_stop_loss:
                     info("\n      - Loss is negligible. Stopping early.")
-                break
+                return True
+            return False
+
+        def _forward():
+            W_q_refined = W_rounded + delta
+            current_dq = W_q_refined / scale
+            error = current_dq - W_float32
+            projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
+            return torch.linalg.norm(projected_error)
+
+        forward_fn = self._maybe_compile_loop(_forward)
+
+        sync_batch = self._get_sync_batch()
+        pending_losses: list = []
+        for i in pbar:
+            optimizer.zero_grad()
+            loss = forward_fn()
+
+            loss.backward()
+            optimizer.step()
+
+            if sync_batch <= 1:
+                if _process_iteration(i, loss.item()):
+                    break
+            else:
+                pending_losses.append(loss.detach())
+                if len(pending_losses) >= sync_batch or i == self.num_iter - 1:
+                    replay_vals = torch.stack(pending_losses).tolist()
+                    pending_losses = []
+                    stop = False
+                    for offset, val in enumerate(replay_vals):
+                        if _process_iteration(i - len(replay_vals) + offset + 1, val):
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         pbar.close()
         return W_rounded + best_delta
@@ -423,26 +479,18 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             W_float32.shape[0], W_float32.shape[1]
         )
 
-        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing (Prodigy-{schedule_name})", leave=False, dynamic_ncols=True)
-        for i in pbar:
-            optimizer.zero_grad()
-            W_q_refined = W_rounded + delta
+        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing (Prodigy-{schedule_name})", leave=False, dynamic_ncols=True, mininterval=0.5)
 
-            current_dq = W_q_refined / scale
-            error = current_dq - W_float32
-            projected_error = U_k.T @ error @ Vh_k.T
-            loss = torch.linalg.norm(projected_error)
-
-            loss.backward()
-            optimizer.step()
-
-            current_loss_val = loss.item()
+        def _process_iteration(i: int, current_loss_val: float) -> bool:
+            """Scalar bookkeeping for one iteration. Returns True to stop early."""
+            nonlocal best_loss, best_delta, worse_loss_counter, plateau_counter, cooldown_counter, curr_lr
             prev_worse_counter = worse_loss_counter
             improved = self._check_improvement(current_loss_val, best_loss)
 
             if improved:
                 best_loss = current_loss_val
-                best_delta = delta.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_delta = delta.detach().clone()
                 plateau_counter = 0
                 if self.lr_adaptive_mode == "simple-reset":
                     worse_loss_counter = 0
@@ -492,7 +540,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     worse_loss_counter = 0
 
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -501,7 +549,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -517,7 +565,42 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     info("\n      - Loss has stalled. Stopping early.")
                 elif best_loss <= self.early_stop_loss:
                     info("\n      - Loss is negligible. Stopping early.")
-                break
+                return True
+            return False
+
+        def _forward():
+            W_q_refined = W_rounded + delta
+            current_dq = W_q_refined / scale
+            error = current_dq - W_float32
+            projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
+            return torch.linalg.norm(projected_error)
+
+        forward_fn = self._maybe_compile_loop(_forward)
+
+        sync_batch = self._get_sync_batch()
+        pending_losses: list = []
+        for i in pbar:
+            optimizer.zero_grad()
+            loss = forward_fn()
+
+            loss.backward()
+            optimizer.step()
+
+            if sync_batch <= 1:
+                if _process_iteration(i, loss.item()):
+                    break
+            else:
+                pending_losses.append(loss.detach())
+                if len(pending_losses) >= sync_batch or i == self.num_iter - 1:
+                    replay_vals = torch.stack(pending_losses).tolist()
+                    pending_losses = []
+                    stop = False
+                    for offset, val in enumerate(replay_vals):
+                        if _process_iteration(i - len(replay_vals) + offset + 1, val):
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         pbar.close()
         return W_rounded + best_delta
@@ -569,15 +652,18 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             effective_factor = self.lr_factor
             effective_cooldown = self.lr_cooldown
 
-        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing (Original-{schedule_name})", leave=False, dynamic_ncols=True)
-        for i in pbar:
-            with torch.no_grad():
-                current_dq = W_q_refined / scale
-                error = current_dq - W_float32
-                projected_error = U_k.T @ error @ Vh_k.T
-                loss = torch.linalg.norm(projected_error)
+        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing (Original-{schedule_name})", leave=False, dynamic_ncols=True, mininterval=0.5)
 
-            current_loss = loss.item()
+        def _grad_step(projected_error: torch.Tensor, loss: torch.Tensor) -> None:
+            """Manual LR-step update of W_q_refined (no autograd)."""
+            nonlocal W_q_refined
+            with torch.no_grad():
+                grad_direction = U_k @ (projected_error / loss.clamp_min(1e-20)) @ Vh_k
+                W_q_refined -= curr_lr * (grad_direction * scale)
+
+        def _process_iteration(i: int, current_loss: float) -> bool:
+            """Scalar bookkeeping for one iteration. Returns True to stop early."""
+            nonlocal best_loss, best_tensor, worse_loss_counter, plateau_counter, cooldown_counter, curr_lr
             # Check if improvement exceeds threshold (supports rel/abs mode like PyTorch ReduceLROnPlateau)
             if self.lr_threshold > 0:
                 if self.lr_threshold_mode == "rel":
@@ -594,7 +680,8 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             if improved:
                 best_loss = current_loss
-                best_tensor = W_q_refined.clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_tensor = W_q_refined.clone()
                 plateau_counter = 0
                 worse_loss_counter = 0
                 # no-reset mode: worse_loss_counter preserved for tier calculation
@@ -638,7 +725,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             # Show schedule-appropriate metric in progress bar
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -647,7 +734,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -670,11 +757,38 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     info("\n      - Learning Rate has bottomed out. Stopping.")
                 elif worse_loss_counter > self.early_stop_stall:
                     info("\n      - Loss has stalled. Stopping.")
-                break
+                return True
+            return False
 
+        sync_batch = self._get_sync_batch()
+        pending_losses: list = []
+        for i in pbar:
             with torch.no_grad():
-                grad_direction = U_k @ (projected_error / loss.clamp_min(1e-20)) @ Vh_k
-                W_q_refined -= curr_lr * (grad_direction * scale)
+                current_dq = W_q_refined / scale
+                error = current_dq - W_float32
+                projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
+                loss = torch.linalg.norm(projected_error)
+
+            if sync_batch <= 1:
+                if _process_iteration(i, loss.item()):
+                    break
+                _grad_step(projected_error, loss)
+            else:
+                # Batch mode: the grad step runs immediately with the current
+                # (possibly not-yet-replayed) lr, so lr updates lag the math by
+                # up to sync_batch-1 iterations. Opt-in tradeoff, CUDA only.
+                pending_losses.append(loss.detach())
+                _grad_step(projected_error, loss)
+                if len(pending_losses) >= sync_batch or i == self.num_iter - 1:
+                    replay_vals = torch.stack(pending_losses).tolist()
+                    pending_losses = []
+                    stop = False
+                    for offset, val in enumerate(replay_vals):
+                        if _process_iteration(i - len(replay_vals) + offset + 1, val):
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         pbar.close()
         return best_tensor if best_tensor is not None else W_q_refined
@@ -703,6 +817,9 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     self._current_extra_tensors = {}
                     self.last_primary_convrot_group_size = None
 
+                    # All-zeros check on CPU before any transfer: avoids a full
+                    # reduction + device sync per tensor on GPU runs.
+                    is_all_zeros = bool((W_orig == 0).all().item())
                     W_float32 = transfer_to_gpu_pinned(W_orig, self.device, COMPUTE_DTYPE)
 
                     # Determine if we should optimize
@@ -713,7 +830,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                         and self.convrot
                         and self.no_learned_rounding
                     )
-                    if torch.all(W_float32 == 0) and not targeted_simple_convrot:
+                    if is_all_zeros and not targeted_simple_convrot:
                         verbose("  - Tensor is all zeros, skipping optimization.")
                         quantized_tensor = torch.zeros_like(W_float32, dtype=self.target_dtype)
                         dequant_scale = None
@@ -873,9 +990,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
         # Clean up
         del W_float32
-        gc.collect()
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
+        default_gc_debouncer.maybe_collect()
 
         return (qdata, scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized_weight)
 
@@ -973,9 +1088,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
                     # Clean up Pass 1 intermediate tensors immediately to prevent VRAM accumulation
                     del dequant_opt, row_max_opt, scale_opt
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    default_gc_debouncer.maybe_collect()
 
                     verbose("    - Scale Optimization: DUALROUND (Pass 2)")
                     qdata, scale = self._optimize_int8_adaround(W_float32, qdata, scale, X_rot, Y_ref)
@@ -1145,7 +1258,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             init_W_q_rounded = qdata.to(COMPUTE_DTYPE)
             init_W_rounded_dequant = init_W_q_rounded * scale_broadcast
             init_mse_rounded = torch.nn.functional.mse_loss(X_rot @ init_W_rounded_dequant.T, Y_ref)
-            init_svd_rounded = torch.linalg.norm(U_k.T @ (init_W_rounded_dequant - W_float32) @ Vh_k.T)
+            init_svd_rounded = torch.linalg.norm(U_k.T @ (init_W_rounded_dequant - W_float32).to(U_k.dtype) @ Vh_k.T)
 
         # Regularization balance factor: ~5% of initial rounded MSE loss
         lambda_reg = 0.05 * max(init_mse_rounded.item(), 1e-5)
@@ -1179,69 +1292,19 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         target_converged_ratio = 0.90
 
         loss_history = []
+        # Hoist loop-invariant scalars: avoids per-iteration device syncs.
+        init_mse_val = max(init_mse_rounded.item(), 1e-12)
+        init_svd_val = init_svd_rounded.item()
+        use_svd_term = alpha_svd > 0 and init_svd_val > 1e-8
+
         pbar = tqdm(
             range(self.num_iter), desc=f"    Optimizing (AdaRound-{self.optimizer_choice}-{schedule_name})", leave=False,
-            dynamic_ncols=True
+            dynamic_ncols=True, mininterval=0.5
         )
-        for i in pbar:
-            if optimizer is not None:
-                optimizer.zero_grad()
 
-            # Forward pass: Optimized soft rounding (smooth AdaRound)
-            # Calculate current temperature (linear decay from T_start to T_end)
-            temp = T_start + (T_end - T_start) * (i / self.num_iter)
-            h_V = torch.sigmoid(V / temp)
-            # Use soft weights for smooth gradient flow during optimization
-            W_q = W_floor + h_V
-            W_dequant = W_q * scale_broadcast
-
-            # --- Discretization and Convergence early stopping check ---
-            # Track the true physical percentage of parameters converged to strict integer boundaries (temp=1.0)
-            converged_ratio = ((torch.sigmoid(V) < 0.05) | (torch.sigmoid(V) > 0.95)).float().mean().item()
-
-            # Loss 1: Output activation MSE on soft dequantized weights
-            Y_pred = X_rot @ W_dequant.T
-            loss_mse = torch.nn.functional.mse_loss(Y_pred, Y_ref)
-
-            # Loss 2: SVD-guided weight-space projection error (soft)
-            weight_error = W_dequant - W_float32
-            projected_error = U_k.T @ weight_error @ Vh_k.T
-            loss_svd = torch.linalg.norm(projected_error)
-
-            # Loss 3: Soft rounding binary regularizer
-            loss_reg = (1.0 - (2.0 * h_V - 1.0).pow(2)).mean()
-
-            # Total Loss - Normalized for numerical stability on real-world weights
-            # We scale MSE and SVD losses so they start relative to 1.0
-            loss_mse_scaled = loss_mse / max(init_mse_rounded.item(), 1e-12)
-
-            if alpha_svd > 0 and init_svd_rounded.item() > 1e-8:
-                loss_svd_scaled = loss_svd / init_svd_rounded.item()
-            else:
-                loss_svd_scaled = 0.0
-
-            # Combine with fixed weights: 1.0 for MSE, 0.01 for SVD, 0.1 for Reg
-            loss = loss_mse_scaled + 0.01 * loss_svd_scaled + 0.1 * loss_reg
-
-            # Scale up loss for backpropagation to prevent float32 underflow on large layers
-            scaled_loss = loss * 1e5
-
-            if optimizer is not None:
-                scaled_loss.backward()
-                if V.grad is not None:
-                    # Scale gradients back down before optimizer steps to protect scale-sensitive optimizers (e.g. Prodigy distance estimator)
-                    V.grad.div_(1e5)
-                optimizer.step()
-            else:
-                # Manual SGD
-                if V.grad is not None:
-                    V.grad.zero_()
-                scaled_loss.backward()
-                with torch.no_grad():
-                    # Divide gradient back down to match manual learning rate scale
-                    V -= curr_lr * (V.grad / 1e5)
-
-            current_loss_val = loss.item()
+        def _process_iteration(i: int, current_loss_val: float, converged_ratio: float) -> bool:
+            """Scalar bookkeeping for one iteration. Returns True to stop early."""
+            nonlocal best_loss, best_V, best_converged_ratio, worse_loss_counter, plateau_counter, cooldown_counter, curr_lr
             prev_worse_counter = worse_loss_counter
             improved = self._check_improvement(current_loss_val, best_loss)
 
@@ -1257,11 +1320,12 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 loss_span = max(loss_history) - min(loss_history)
                 if loss_span < loss_span_threshold:
                     verbose(f"\n      - Discretization early stop: {converged_ratio*100:.2f}% parameters converged. Loss span: {loss_span:.2e} (< {loss_span_threshold:.2e}). Stopping.")
-                    break
+                    return True
 
             if improved:
                 best_loss = current_loss_val
-                best_V = V.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_V = V.detach().clone()
                 best_converged_ratio = converged_ratio
                 plateau_counter = 0
                 if self.lr_adaptive_mode == "simple-reset":
@@ -1316,7 +1380,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             # Schedule-appropriate postfix
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -1325,7 +1389,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -1342,7 +1406,88 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     info("\n      - Loss has stalled. Stopping early.")
                 elif best_loss <= self.early_stop_loss:
                     info("\n      - Loss is negligible. Stopping early.")
-                break
+                return True
+            return False
+
+        sync_batch = self._get_sync_batch()
+        pending_losses: list = []
+        pending_converged: list = []
+        for i in pbar:
+            if optimizer is not None:
+                optimizer.zero_grad()
+
+            # Forward pass: Optimized soft rounding (smooth AdaRound)
+            # Calculate current temperature (linear decay from T_start to T_end)
+            temp = T_start + (T_end - T_start) * (i / self.num_iter)
+            h_V = torch.sigmoid(V / temp)
+            # Use soft weights for smooth gradient flow during optimization
+            W_q = W_floor + h_V
+            W_dequant = W_q * scale_broadcast
+
+            # --- Discretization and Convergence early stopping check ---
+            # Track the true physical percentage of parameters converged to strict integer boundaries (temp=1.0)
+            converged_ratio_t = ((torch.sigmoid(V) < 0.05) | (torch.sigmoid(V) > 0.95)).float().mean()
+
+            # Loss 1: Output activation MSE on soft dequantized weights
+            Y_pred = X_rot @ W_dequant.T
+            loss_mse = torch.nn.functional.mse_loss(Y_pred, Y_ref)
+
+            # Loss 2: SVD-guided weight-space projection error (soft)
+            weight_error = W_dequant - W_float32
+            projected_error = U_k.T @ weight_error.to(U_k.dtype) @ Vh_k.T
+            loss_svd = torch.linalg.norm(projected_error)
+
+            # Loss 3: Soft rounding binary regularizer
+            loss_reg = (1.0 - (2.0 * h_V - 1.0).pow(2)).mean()
+
+            # Total Loss - Normalized for numerical stability on real-world weights
+            # We scale MSE and SVD losses so they start relative to 1.0
+            loss_mse_scaled = loss_mse / init_mse_val
+
+            if use_svd_term:
+                loss_svd_scaled = loss_svd / init_svd_val
+            else:
+                loss_svd_scaled = 0.0
+
+            # Combine with fixed weights: 1.0 for MSE, 0.01 for SVD, 0.1 for Reg
+            loss = loss_mse_scaled + 0.01 * loss_svd_scaled + 0.1 * loss_reg
+
+            # Scale up loss for backpropagation to prevent float32 underflow on large layers
+            scaled_loss = loss * 1e5
+
+            if optimizer is not None:
+                scaled_loss.backward()
+                if V.grad is not None:
+                    # Scale gradients back down before optimizer steps to protect scale-sensitive optimizers (e.g. Prodigy distance estimator)
+                    V.grad.div_(1e5)
+                optimizer.step()
+            else:
+                # Manual SGD
+                if V.grad is not None:
+                    V.grad.zero_()
+                scaled_loss.backward()
+                with torch.no_grad():
+                    # Divide gradient back down to match manual learning rate scale
+                    V -= curr_lr * (V.grad / 1e5)
+
+            if sync_batch <= 1:
+                if _process_iteration(i, loss.item(), converged_ratio_t.item()):
+                    break
+            else:
+                pending_losses.append(loss.detach())
+                pending_converged.append(converged_ratio_t.detach())
+                if len(pending_losses) >= sync_batch or i == self.num_iter - 1:
+                    replay_vals = torch.stack(pending_losses).tolist()
+                    replay_conv = torch.stack(pending_converged).tolist()
+                    pending_losses = []
+                    pending_converged = []
+                    stop = False
+                    for offset, (val, conv) in enumerate(zip(replay_vals, replay_conv)):
+                        if _process_iteration(i - len(replay_vals) + offset + 1, val, conv):
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         pbar.close()
 
@@ -1364,9 +1509,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         W_floor = None
         X_rot = None
         Y_ref = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        default_gc_debouncer.maybe_collect()
 
         return final_qdata, scale
 
@@ -1417,33 +1560,18 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         plateau_counter = 0
         cooldown_counter = 0
 
-        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing INT8 (AdamW-{schedule_name})", leave=False, dynamic_ncols=True)
-        for i in pbar:
-            optimizer.zero_grad()
+        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing INT8 (AdamW-{schedule_name})", leave=False, dynamic_ncols=True, mininterval=0.5)
 
-            q_refined = qdata_float + delta
-
-            if scaling_mode == "block":
-                current_dq = self._int8_dequantize_blockwise(q_refined, scale, M, N, block_size)
-            elif scaling_mode == "row":
-                current_dq = self._int8_dequantize_rowwise(q_refined, scale, M, N)
-            else:
-                raise ValueError(f"Unsupported scaling mode for INT8 learned rounding: {scaling_mode}")
-
-            error = current_dq - W_float32
-            projected_error = U_k.T @ error @ Vh_k.T
-            loss = torch.linalg.norm(projected_error)
-
-            loss.backward()
-            optimizer.step()
-
-            current_loss_val = loss.item()
+        def _process_iteration(i: int, current_loss_val: float) -> bool:
+            """Scalar bookkeeping for one iteration. Returns True to stop early."""
+            nonlocal best_loss, best_delta, worse_loss_counter, plateau_counter, cooldown_counter, curr_lr
             prev_worse_counter = worse_loss_counter
             improved = self._check_improvement(current_loss_val, best_loss)
 
             if improved:
                 best_loss = current_loss_val
-                best_delta = delta.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_delta = delta.detach().clone()
                 plateau_counter = 0
                 if self.lr_adaptive_mode == "simple-reset":
                     worse_loss_counter = 0
@@ -1496,7 +1624,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             # Schedule-appropriate postfix
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -1505,7 +1633,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -1522,7 +1650,48 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     info("\n      - Loss has stalled. Stopping early.")
                 elif best_loss <= self.early_stop_loss:
                     info("\n      - Loss is negligible. Stopping early.")
-                break
+                return True
+            return False
+
+        def _forward():
+            q_refined = qdata_float + delta
+            if scaling_mode == "block":
+                current_dq = self._int8_dequantize_blockwise(q_refined, scale, M, N, block_size)
+            elif scaling_mode == "row":
+                current_dq = self._int8_dequantize_rowwise(q_refined, scale, M, N)
+            else:
+                raise ValueError(f"Unsupported scaling mode for INT8 learned rounding: {scaling_mode}")
+            error = current_dq - W_float32
+            projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
+            return torch.linalg.norm(projected_error)
+
+        forward_fn = self._maybe_compile_loop(_forward)
+
+        sync_batch = self._get_sync_batch()
+        pending_losses: list = []
+        for i in pbar:
+            optimizer.zero_grad()
+
+            loss = forward_fn()
+
+            loss.backward()
+            optimizer.step()
+
+            if sync_batch <= 1:
+                if _process_iteration(i, loss.item()):
+                    break
+            else:
+                pending_losses.append(loss.detach())
+                if len(pending_losses) >= sync_batch or i == self.num_iter - 1:
+                    replay_vals = torch.stack(pending_losses).tolist()
+                    pending_losses = []
+                    stop = False
+                    for offset, val in enumerate(replay_vals):
+                        if _process_iteration(i - len(replay_vals) + offset + 1, val):
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         pbar.close()
 
@@ -1551,33 +1720,18 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         plateau_counter = 0
         cooldown_counter = 0
 
-        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing INT8 (RAdam-{schedule_name})", leave=False, dynamic_ncols=True)
-        for i in pbar:
-            optimizer.zero_grad()
+        pbar = tqdm(range(self.num_iter), desc=f"    Optimizing INT8 (RAdam-{schedule_name})", leave=False, dynamic_ncols=True, mininterval=0.5)
 
-            q_refined = qdata_float + delta
-
-            if scaling_mode == "block":
-                current_dq = self._int8_dequantize_blockwise(q_refined, scale, M, N, block_size)
-            elif scaling_mode == "row":
-                current_dq = self._int8_dequantize_rowwise(q_refined, scale, M, N)
-            else:
-                raise ValueError(f"Unsupported scaling mode for INT8 learned rounding: {scaling_mode}")
-
-            error = current_dq - W_float32
-            projected_error = U_k.T @ error @ Vh_k.T
-            loss = torch.linalg.norm(projected_error)
-
-            loss.backward()
-            optimizer.step()
-
-            current_loss_val = loss.item()
+        def _process_iteration(i: int, current_loss_val: float) -> bool:
+            """Scalar bookkeeping for one iteration. Returns True to stop early."""
+            nonlocal best_loss, best_delta, worse_loss_counter, plateau_counter, cooldown_counter, curr_lr
             prev_worse_counter = worse_loss_counter
             improved = self._check_improvement(current_loss_val, best_loss)
 
             if improved:
                 best_loss = current_loss_val
-                best_delta = delta.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_delta = delta.detach().clone()
                 plateau_counter = 0
                 if self.lr_adaptive_mode == "simple-reset":
                     worse_loss_counter = 0
@@ -1630,7 +1784,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             # Schedule-appropriate postfix
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -1639,7 +1793,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -1656,7 +1810,48 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     info("\n      - Loss has stalled. Stopping early.")
                 elif best_loss <= self.early_stop_loss:
                     info("\n      - Loss is negligible. Stopping early.")
-                break
+                return True
+            return False
+
+        def _forward():
+            q_refined = qdata_float + delta
+            if scaling_mode == "block":
+                current_dq = self._int8_dequantize_blockwise(q_refined, scale, M, N, block_size)
+            elif scaling_mode == "row":
+                current_dq = self._int8_dequantize_rowwise(q_refined, scale, M, N)
+            else:
+                raise ValueError(f"Unsupported scaling mode for INT8 learned rounding: {scaling_mode}")
+            error = current_dq - W_float32
+            projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
+            return torch.linalg.norm(projected_error)
+
+        forward_fn = self._maybe_compile_loop(_forward)
+
+        sync_batch = self._get_sync_batch()
+        pending_losses: list = []
+        for i in pbar:
+            optimizer.zero_grad()
+
+            loss = forward_fn()
+
+            loss.backward()
+            optimizer.step()
+
+            if sync_batch <= 1:
+                if _process_iteration(i, loss.item()):
+                    break
+            else:
+                pending_losses.append(loss.detach())
+                if len(pending_losses) >= sync_batch or i == self.num_iter - 1:
+                    replay_vals = torch.stack(pending_losses).tolist()
+                    pending_losses = []
+                    stop = False
+                    for offset, val in enumerate(replay_vals):
+                        if _process_iteration(i - len(replay_vals) + offset + 1, val):
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         pbar.close()
 
@@ -1690,34 +1885,20 @@ class LearnedRoundingConverter(BaseLearnedConverter):
         cooldown_counter = 0
 
         pbar = tqdm(
-            range(self.num_iter), desc=f"    Optimizing INT8 (Prodigy-{schedule_name})", leave=False, dynamic_ncols=True
+            range(self.num_iter), desc=f"    Optimizing INT8 (Prodigy-{schedule_name})", leave=False, dynamic_ncols=True,
+            mininterval=0.5
         )
-        for i in pbar:
-            optimizer.zero_grad()
 
-            q_refined = qdata_float + delta
-
-            if scaling_mode == "block":
-                current_dq = self._int8_dequantize_blockwise(q_refined, scale, M, N, block_size)
-            elif scaling_mode == "row":
-                current_dq = self._int8_dequantize_rowwise(q_refined, scale, M, N)
-            else:
-                raise ValueError(f"Unsupported scaling mode for INT8 learned rounding: {scaling_mode}")
-
-            error = current_dq - W_float32
-            projected_error = U_k.T @ error @ Vh_k.T
-            loss = torch.linalg.norm(projected_error)
-
-            loss.backward()
-            optimizer.step()
-
-            current_loss_val = loss.item()
+        def _process_iteration(i: int, current_loss_val: float) -> bool:
+            """Scalar bookkeeping for one iteration. Returns True to stop early."""
+            nonlocal best_loss, best_delta, worse_loss_counter, plateau_counter, cooldown_counter, curr_lr
             prev_worse_counter = worse_loss_counter
             improved = self._check_improvement(current_loss_val, best_loss)
 
             if improved:
                 best_loss = current_loss_val
-                best_delta = delta.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_delta = delta.detach().clone()
                 plateau_counter = 0
                 if self.lr_adaptive_mode == "simple-reset":
                     worse_loss_counter = 0
@@ -1759,7 +1940,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 if improved and self.lr_adaptive_mode == "no-reset":
                     worse_loss_counter = 0
 
-            pbar.set_postfix({"loss": f"{current_loss_val:.3e}", "best": f"{best_loss:.3e}", "lr": f"{curr_lr:.2e}"})
+            set_postfix_throttled(pbar,{"loss": f"{current_loss_val:.3e}", "best": f"{best_loss:.3e}", "lr": f"{curr_lr:.2e}"})
 
             if best_loss <= self.early_stop_loss or curr_lr <= self.early_stop_lr or worse_loss_counter > self.early_stop_stall:
                 if curr_lr <= self.early_stop_lr:
@@ -1768,7 +1949,48 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     info("\n      - Loss has stalled. Stopping early.")
                 elif best_loss <= self.early_stop_loss:
                     info("\n      - Loss is negligible. Stopping early.")
-                break
+                return True
+            return False
+
+        def _forward():
+            q_refined = qdata_float + delta
+            if scaling_mode == "block":
+                current_dq = self._int8_dequantize_blockwise(q_refined, scale, M, N, block_size)
+            elif scaling_mode == "row":
+                current_dq = self._int8_dequantize_rowwise(q_refined, scale, M, N)
+            else:
+                raise ValueError(f"Unsupported scaling mode for INT8 learned rounding: {scaling_mode}")
+            error = current_dq - W_float32
+            projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
+            return torch.linalg.norm(projected_error)
+
+        forward_fn = self._maybe_compile_loop(_forward)
+
+        sync_batch = self._get_sync_batch()
+        pending_losses: list = []
+        for i in pbar:
+            optimizer.zero_grad()
+
+            loss = forward_fn()
+
+            loss.backward()
+            optimizer.step()
+
+            if sync_batch <= 1:
+                if _process_iteration(i, loss.item()):
+                    break
+            else:
+                pending_losses.append(loss.detach())
+                if len(pending_losses) >= sync_batch or i == self.num_iter - 1:
+                    replay_vals = torch.stack(pending_losses).tolist()
+                    pending_losses = []
+                    stop = False
+                    for offset, val in enumerate(replay_vals):
+                        if _process_iteration(i - len(replay_vals) + offset + 1, val):
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         pbar.close()
 
@@ -1825,21 +2047,22 @@ class LearnedRoundingConverter(BaseLearnedConverter):
             effective_cooldown = self.lr_cooldown
 
         pbar = tqdm(
-            range(self.num_iter), desc=f"    Optimizing INT8 (Original-{schedule_name})", leave=False, dynamic_ncols=True
+            range(self.num_iter), desc=f"    Optimizing INT8 (Original-{schedule_name})", leave=False, dynamic_ncols=True,
+            mininterval=0.5
         )
-        for i in pbar:
-            with torch.no_grad():
-                if scaling_mode == "block":
-                    current_dq = self._int8_dequantize_blockwise(q_refined, scale, M, N, block_size)
-                elif scaling_mode == "row":
-                    current_dq = self._int8_dequantize_rowwise(q_refined, scale, M, N)
-                else:
-                    raise ValueError(f"Unsupported scaling mode for INT8 learned rounding: {scaling_mode}")
-                error = current_dq - W_float32
-                projected_error = U_k.T @ error @ Vh_k.T
-                loss = torch.linalg.norm(projected_error)
 
-            current_loss = loss.item()
+        def _grad_step(projected_error: torch.Tensor, loss: torch.Tensor) -> None:
+            """Manual LR-step update of q_refined (no autograd)."""
+            nonlocal q_refined
+            with torch.no_grad():
+                # Gradient in quantized Q-space.
+                # Use global max to scale gradient magnitude matching tensor mode.
+                grad_direction = U_k @ (projected_error / loss.clamp_min(1e-20)) @ Vh_k
+                q_refined -= curr_lr * (grad_direction * grad_scale)
+
+        def _process_iteration(i: int, current_loss: float) -> bool:
+            """Scalar bookkeeping for one iteration. Returns True to stop early."""
+            nonlocal best_loss, best_tensor, worse_loss_counter, plateau_counter, cooldown_counter, curr_lr
             # Check if improvement exceeds threshold (supports rel/abs mode like PyTorch ReduceLROnPlateau)
             if self.lr_threshold > 0:
                 if self.lr_threshold_mode == "rel":
@@ -1856,7 +2079,8 @@ class LearnedRoundingConverter(BaseLearnedConverter):
 
             if improved:
                 best_loss = current_loss
-                best_tensor = q_refined.clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_tensor = q_refined.clone()
                 plateau_counter = 0
                 worse_loss_counter = 0
                 # no-reset mode: worse_loss_counter preserved for tier calculation
@@ -1890,7 +2114,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 if improved and self.lr_adaptive_mode == "no-reset":
                     worse_loss_counter = 0
 
-            pbar.set_postfix(
+            set_postfix_throttled(pbar,
                 {
                     "loss": f"{current_loss:.3e}",
                     "best": f"{best_loss:.3e}",
@@ -1913,13 +2137,43 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     info("\n      - Learning Rate has bottomed out. Stopping.")
                 elif worse_loss_counter > self.early_stop_stall:
                     info("\n      - Loss has stalled. Stopping.")
-                break
+                return True
+            return False
 
+        sync_batch = self._get_sync_batch()
+        pending_losses: list = []
+        for i in pbar:
             with torch.no_grad():
-                # Gradient in quantized Q-space.
-                # Use global max to scale gradient magnitude matching tensor mode.
-                grad_direction = U_k @ (projected_error / loss.clamp_min(1e-20)) @ Vh_k
-                q_refined -= curr_lr * (grad_direction * grad_scale)
+                if scaling_mode == "block":
+                    current_dq = self._int8_dequantize_blockwise(q_refined, scale, M, N, block_size)
+                elif scaling_mode == "row":
+                    current_dq = self._int8_dequantize_rowwise(q_refined, scale, M, N)
+                else:
+                    raise ValueError(f"Unsupported scaling mode for INT8 learned rounding: {scaling_mode}")
+                error = current_dq - W_float32
+                projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
+                loss = torch.linalg.norm(projected_error)
+
+            if sync_batch <= 1:
+                if _process_iteration(i, loss.item()):
+                    break
+                _grad_step(projected_error, loss)
+            else:
+                # Batch mode: the grad step runs immediately with the current
+                # (possibly not-yet-replayed) lr, so lr updates lag the math by
+                # up to sync_batch-1 iterations. Opt-in tradeoff, CUDA only.
+                pending_losses.append(loss.detach())
+                _grad_step(projected_error, loss)
+                if len(pending_losses) >= sync_batch or i == self.num_iter - 1:
+                    replay_vals = torch.stack(pending_losses).tolist()
+                    pending_losses = []
+                    stop = False
+                    for offset, val in enumerate(replay_vals):
+                        if _process_iteration(i - len(replay_vals) + offset + 1, val):
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         pbar.close()
 
@@ -1975,9 +2229,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                     dequant_scale = dequant_scale.to(device=self.device, dtype=SCALE_DTYPE)
                 dequantized_weight_tensor = W_f8.to(self.device, dtype=COMPUTE_DTYPE) / scale
             del W_float32, scale, compact_scale
-            gc.collect()
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
+            default_gc_debouncer.maybe_collect()
             return W_f8, dequant_scale, dequantized_weight_tensor
 
         # Use inherited SVD computation
@@ -2007,9 +2259,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 dequant_scale = dequant_scale.to(device=self.device, dtype=SCALE_DTYPE)
             dequantized_weight_tensor = W_f8.to(self.device, dtype=COMPUTE_DTYPE) / scale
         del W_float32, scale, U_k, Vh_k, final_tensor_scaled, compact_scale
-        gc.collect()
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
+        default_gc_debouncer.maybe_collect()
 
         return (W_f8, dequant_scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized_weight_tensor)
 
@@ -2036,9 +2286,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 dequantized = W_f8.to(COMPUTE_DTYPE) / quant_scale
 
             del W_float32
-            gc.collect()
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
+            default_gc_debouncer.maybe_collect()
 
             return (W_f8, dequant_scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized)
 
@@ -2108,9 +2356,7 @@ class LearnedRoundingConverter(BaseLearnedConverter):
                 dequantized = dequantized_blocked.permute(0, 2, 1, 3).reshape(M, N)
 
             del W_float32, W_blocked
-            gc.collect()
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
+            default_gc_debouncer.maybe_collect()
 
             return (W_f8, dequant_scale.to(device=self.device, dtype=SCALE_DTYPE), dequantized)
 

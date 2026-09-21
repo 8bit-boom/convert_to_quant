@@ -22,6 +22,7 @@ from ..converters.learned_mxfp8 import LearnedMXFP8Converter
 from ..converters.learned_nvfp4 import LearnedNVFP4Converter
 from ..converters.learned_rounding import LearnedRoundingConverter
 from ..utils.comfy_quant import create_comfy_quant_tensor, should_skip_layer_for_performance
+from ..utils.debounced_gc import default_gc_debouncer
 from ..utils.logging import error, info, log_debug, minimal, verbose, warning
 from ..utils.memory_efficient_loader import MemoryEfficientSafeOpen
 from ..utils.output_dtype import cast_unquantized_weights, compile_preserve_layers, resolve_output_dtype
@@ -649,9 +650,7 @@ def convert_to_fp8_scaled(
             # Cleanup calibration_data immediately if loaded from disk to prevent OOM
             if calib_data_loaded and calibration_data is not None:
                 del calibration_data
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                default_gc_debouncer.maybe_collect()
 
         new_tensors[key] = q_tensor.to(device="cpu")
         quantized_weight_keys.add(key)
@@ -880,7 +879,7 @@ def convert_to_fp8_scaled(
 
                         if isinstance(cache_entry, str):
                             del calib_data
-                            gc.collect()
+                            default_gc_debouncer.maybe_collect()
             else:
                 # No dequant_w available (shouldn't happen with learned rounding)
                 new_tensors[bias_key] = loader.get_tensor(bias_key)
@@ -911,9 +910,7 @@ def convert_to_fp8_scaled(
         comfy_quant_tensor = None
         bias_correction = None
         if low_memory:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            default_gc_debouncer.maybe_collect()
 
         if checkpoint is not None:
             _checkpoint_record(key)

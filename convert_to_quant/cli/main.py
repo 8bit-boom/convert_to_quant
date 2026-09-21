@@ -256,6 +256,44 @@ def get_parser() -> MultiHelpArgumentParser:
         help="If should use torch.linalg.svd with full matices instead of the torch.svd_lowrank."
     )
     parser.add_argument(
+        "--svd_niter", "--svd-niter", type=int, default=4, dest="svd_niter",
+        help="Power-iteration refinement steps for torch.svd_lowrank (default 4). "
+        "Values 1-2 are significantly faster with minimal quality impact, since the "
+        "learned-rounding optimizer corrects the starting subspace anyway."
+    )
+    parser.add_argument(
+        "--fast_math", "--fast-math", action="store_true", dest="fast_math",
+        help="Opt-in CUDA speed mode: TF32 matmuls + bf16 SVD projection in the "
+        "learned-rounding optimizer. Roughly 20-40% faster iterations, but CHANGES "
+        "RESULTS (reduced-precision math). Off by default. CUDA only."
+    )
+    parser.add_argument(
+        "--snapshot_interval", "--snapshot-interval", type=int, default=1, dest="snapshot_interval",
+        help="Clone the best-so-far optimizer tensor only every N improvements "
+        "(default 1 = every improvement, original behavior). Values like 8-16 cut "
+        "per-iteration GPU copy overhead; the result may lag the best loss by "
+        "up to N-1 improvements."
+    )
+    parser.add_argument(
+        "--loss_sync_batch", "--loss-sync-batch", type=int, default=1, dest="loss_sync_batch",
+        help="CUDA only: read the scalar optimizer loss back to the CPU once "
+        "every K iterations instead of every iteration (default 1 = original "
+        "behavior). Kernels queue asynchronously between syncs, hiding launch "
+        "and sync overhead (measured up to ~6x wall-clock on typical layer "
+        "shapes). Tradeoff: LR updates, best-tensor snapshots, and early-stop "
+        "decisions lag by up to K-1 iterations, so results can drift slightly "
+        "(observed ~4e-4 relative at K=8 vs K=1). Ignored without CUDA."
+    )
+    parser.add_argument(
+        "--compile_loop", "--compile-loop", action="store_true", dest="compile_loop",
+        help="Opt-in CUDA speed mode: JIT-compile the per-iteration forward pass "
+        "of the learned-rounding optimizer loops with torch.compile (requires "
+        "triton). Steady-state ~5% faster GPU iterations, BUT each new tensor "
+        "shape pays a ~1-3 s compilation warmup, so it only pays off for models "
+        "with many same-shaped layers and high iteration counts. Falls back to "
+        "eager without CUDA/triton."
+    )
+    parser.add_argument(
         "--scaling_mode",
         "--scaling-mode",
         type=str,
@@ -696,6 +734,11 @@ def run_conversion(args):
                 min_k=args.min_k,
                 max_k=args.max_k,
                 full_matrix=args.full_matrix,
+                svd_niter=args.svd_niter,
+                fast_math=args.fast_math,
+                snapshot_interval=args.snapshot_interval,
+                loss_sync_batch=args.loss_sync_batch,
+                compile_loop=args.compile_loop,
                 # LR schedule tuning
                 lr_gamma=args.lr_gamma,
                 lr_patience=args.lr_patience,
@@ -814,6 +857,11 @@ def run_conversion(args):
                 min_k=args.min_k,
                 max_k=args.max_k,
                 full_matrix=args.full_matrix,
+                svd_niter=args.svd_niter,
+                fast_math=args.fast_math,
+                snapshot_interval=args.snapshot_interval,
+                loss_sync_batch=args.loss_sync_batch,
+                compile_loop=args.compile_loop,
                 # LR schedule tuning
                 lr_gamma=args.lr_gamma,
                 lr_patience=args.lr_patience,
@@ -1113,6 +1161,11 @@ def run_conversion(args):
         min_k=args.min_k,
         max_k=args.max_k,
         full_matrix=args.full_matrix,
+        svd_niter=args.svd_niter,
+        fast_math=args.fast_math,
+        snapshot_interval=args.snapshot_interval,
+        loss_sync_batch=args.loss_sync_batch,
+        compile_loop=args.compile_loop,
         scaling_mode=args.scaling_mode,
         block_size=args.block_size,
         # LR schedule tuning

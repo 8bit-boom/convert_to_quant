@@ -9,7 +9,8 @@ Uses comfy-kitchen CUDA/Triton kernels when available, with PyTorch fallback.
 Requires SM >= 10.0 (datacenter Blackwell) or SM >= 12.0 (consumer RTX 50 series).
 """
 
-import gc
+from ..utils.debounced_gc import default_gc_debouncer
+from ..utils.progress import set_postfix_throttled
 import math
 from typing import (
     Dict,
@@ -124,14 +125,15 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
         Returns:
             Tuple of (packed_qdata, block_scales, per_tensor_scale, dequantized_weight)
         """
+        # All-zeros check on CPU before any transfer: avoids a full
+        # reduction + device sync per tensor on GPU runs.
+        if bool((W_orig == 0).all().item()):
+            verbose("  - Tensor is all zeros, skipping optimization.")
+            return self._quantize_zeros(torch.zeros(W_orig.shape, dtype=COMPUTE_DTYPE, device=self.device))
+
         # Transfer to GPU with pinned memory for large tensors
         W_float32 = transfer_to_gpu_pinned(W_orig, self.device, COMPUTE_DTYPE)
         W_float32_for_lora = W_float32.clone() if self.extract_lora else None
-
-        # Determine if we should optimize
-        if torch.all(W_float32 == 0):
-            verbose("  - Tensor is all zeros, skipping optimization.")
-            return self._quantize_zeros(W_float32)
 
         # Handle padding
         orig_shape = W_float32.shape
@@ -184,9 +186,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
 
         # Cleanup
         del W_float32
-        gc.collect()
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
+        default_gc_debouncer.maybe_collect()
 
         # Error Correction LoRA extraction
         extra_tensors = {}
@@ -309,9 +309,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
         U_k = None
         Vh_k = None
         W_float32 = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        default_gc_debouncer.maybe_collect()
 
         return qdata, final_total_scale
 
@@ -420,7 +418,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
         mode_suffix = f"-{self.scale_optimization}" if self.scale_optimization != "fixed" else ""
         pbar = tqdm(
             range(self.num_iter), desc=f"    Optimizing NVFP4 (Original-{schedule_name}{mode_suffix})", leave=False,
-            dynamic_ncols=True
+            dynamic_ncols=True, mininterval=0.5
         )
 
         for i in pbar:
@@ -450,7 +448,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                 # Dequantize: W_dq = W_q * scale (block-wise)
                 current_dq = self._nvfp4_dequantize_blockwise(W_q_refined, current_total_scale, M, N)
                 error = current_dq - W_float32
-                projected_error = U_k.T @ error @ Vh_k.T
+                projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
                 loss = torch.linalg.norm(projected_error)
 
             current_loss = loss.item()
@@ -468,10 +466,13 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
 
             if improved:
                 best_loss = current_loss
-                best_qdata = W_q_refined.clone()
-                best_total_scale = current_total_scale.clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_qdata = W_q_refined.clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_total_scale = current_total_scale.clone()
                 if self.scale_optimization == "joint":
-                    best_block_scales = block_scales_float.clone()
+                    if (i % self.snapshot_interval) == 0:
+                        best_block_scales = block_scales_float.clone()
                 plateau_counter = 0
                 worse_loss_counter = 0
             else:
@@ -504,7 +505,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                 if improved and self.lr_adaptive_mode == "no-reset":
                     worse_loss_counter = 0
 
-            pbar.set_postfix(
+            set_postfix_throttled(pbar,
                 {
                     "loss": f"{current_loss:.3e}",
                     "best": f"{best_loss:.3e}",
@@ -594,7 +595,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
         mode_suffix = f"-{self.scale_optimization}" if self.scale_optimization != "fixed" else ""
         pbar = tqdm(
             range(self.num_iter), desc=f"    Optimizing NVFP4 (AdamW-{schedule_name}{mode_suffix})", leave=False,
-            dynamic_ncols=True
+            dynamic_ncols=True, mininterval=0.5
         )
 
         for i in pbar:
@@ -610,7 +611,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
             current_dq = self._nvfp4_dequantize_blockwise(q_refined, current_total_scale, M, N)
 
             error = current_dq - W_float32
-            projected_error = U_k.T @ error @ Vh_k.T
+            projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
             loss = torch.linalg.norm(projected_error)
 
             loss.backward()
@@ -627,10 +628,13 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
 
             if improved:
                 best_loss = current_loss_val
-                best_delta = delta.detach().clone()
-                best_total_scale = current_total_scale.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_delta = delta.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_total_scale = current_total_scale.detach().clone()
                 if self.scale_optimization == "joint":
-                    best_block_scales = block_scales_float.detach().clone()
+                    if (i % self.snapshot_interval) == 0:
+                        best_block_scales = block_scales_float.detach().clone()
                 worse_loss_counter = 0
                 plateau_counter = 0
             else:
@@ -668,7 +672,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                     worse_loss_counter = 0
 
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -677,7 +681,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -743,7 +747,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
         mode_suffix = f"-{self.scale_optimization}" if self.scale_optimization != "fixed" else ""
         pbar = tqdm(
             range(self.num_iter), desc=f"    Optimizing NVFP4 (RAdam-{schedule_name}{mode_suffix})", leave=False,
-            dynamic_ncols=True
+            dynamic_ncols=True, mininterval=0.5
         )
 
         for i in pbar:
@@ -759,7 +763,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
             current_dq = self._nvfp4_dequantize_blockwise(q_refined, current_total_scale, M, N)
 
             error = current_dq - W_float32
-            projected_error = U_k.T @ error @ Vh_k.T
+            projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
             loss = torch.linalg.norm(projected_error)
 
             loss.backward()
@@ -776,10 +780,13 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
 
             if improved:
                 best_loss = current_loss_val
-                best_delta = delta.detach().clone()
-                best_total_scale = current_total_scale.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_delta = delta.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_total_scale = current_total_scale.detach().clone()
                 if self.scale_optimization == "joint":
-                    best_block_scales = block_scales_float.detach().clone()
+                    if (i % self.snapshot_interval) == 0:
+                        best_block_scales = block_scales_float.detach().clone()
                 worse_loss_counter = 0
                 plateau_counter = 0
             else:
@@ -817,7 +824,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                     worse_loss_counter = 0
 
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -826,7 +833,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -891,7 +898,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
         mode_suffix = f"-{self.scale_optimization}" if self.scale_optimization != "fixed" else ""
         pbar = tqdm(
             range(self.num_iter), desc=f"    Optimizing NVFP4 (Prodigy-{schedule_name}{mode_suffix})", leave=False,
-            dynamic_ncols=True
+            dynamic_ncols=True, mininterval=0.5
         )
 
         for i in pbar:
@@ -906,7 +913,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
             current_dq = self._nvfp4_dequantize_blockwise(q_refined, current_total_scale, M, N)
 
             error = current_dq - W_float32
-            projected_error = U_k.T @ error @ Vh_k.T
+            projected_error = U_k.T @ error.to(U_k.dtype) @ Vh_k.T
             loss = torch.linalg.norm(projected_error)
 
             loss.backward()
@@ -922,10 +929,13 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
 
             if improved:
                 best_loss = current_loss_val
-                best_delta = delta.detach().clone()
-                best_total_scale = current_total_scale.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_delta = delta.detach().clone()
+                if (i % self.snapshot_interval) == 0:
+                    best_total_scale = current_total_scale.detach().clone()
                 if self.scale_optimization == "joint":
-                    best_block_scales = block_scales_float.detach().clone()
+                    if (i % self.snapshot_interval) == 0:
+                        best_block_scales = block_scales_float.detach().clone()
                 worse_loss_counter = 0
                 plateau_counter = 0
             else:
@@ -960,7 +970,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                     worse_loss_counter = 0
 
             if schedule_name == "plateau":
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
@@ -969,7 +979,7 @@ class LearnedNVFP4Converter(BaseLearnedConverter):
                     }
                 )
             else:
-                pbar.set_postfix(
+                set_postfix_throttled(pbar,
                     {
                         "loss": f"{current_loss_val:.3e}",
                         "best": f"{best_loss:.3e}",
