@@ -23,6 +23,12 @@ from ..utils.logging import error, info, log_debug, minimal, verbose, warning
 from ..utils.memory_efficient_loader import UnifiedSafetensorsLoader
 from ..utils.output_dtype import cast_unquantized_weights, compile_preserve_layers, resolve_output_dtype
 from ..utils.tensor_utils import dict_to_tensor, normalize_tensorwise_scales
+from ..checkpoint import (
+    StopRequested,
+    TensorCheckpoint,
+    restore_stop_signal_handlers,
+    should_stop,
+)
 
 
 @log_debug
@@ -80,6 +86,9 @@ def convert_to_mxfp8(
     lora_output: Optional[str] = None,
     output_dtype: str = "bfloat16",
     preserve_layers: Optional[str] = None,
+    # Checkpoint / stop-and-resume
+    checkpoint_dir: Optional[str] = None,
+    stop_file: Optional[str] = None,
 ) -> None:
     """
     Convert safetensors model to MXFP8 (Microscaling FP8) quantized format.
@@ -102,6 +111,21 @@ def convert_to_mxfp8(
         error(f"ERROR: {exc}")
         return
     quantized_orig_dtype = str(resolved_output_dtype)
+
+    # Checkpoint / resume setup. Must happen before the seed generator is
+    # created below so a resumed run reproduces identical calibration data.
+    checkpoint = None
+    if checkpoint_dir:
+        from ..checkpoint import install_stop_signal_handlers
+
+        install_stop_signal_handlers()
+        if TensorCheckpoint.exists(checkpoint_dir):
+            checkpoint = TensorCheckpoint.open(checkpoint_dir)
+            seed = checkpoint.seed
+            info(
+                f"Resuming from checkpoint: {checkpoint.completed_count}/{checkpoint.total} "
+                f"tensors already done (restored seed={seed})"
+            )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     seed_device = "cpu"
@@ -193,6 +217,28 @@ def convert_to_mxfp8(
     weight_keys = sorted([k for k in all_keys if k.endswith(".weight") and loader.get_ndim(k) == 2])
     total_weights = len(weight_keys)
 
+    if checkpoint_dir:
+        if checkpoint is None:
+            checkpoint = TensorCheckpoint.create(
+                checkpoint_dir,
+                input_file=input_file,
+                seed=seed,
+                target_format="mxfp8",
+                weight_keys=weight_keys,
+            )
+            info(f"Checkpointing progress to: {checkpoint_dir}")
+        else:
+            checkpoint.validate_for(
+                input_file=input_file, target_format="mxfp8", weight_keys=weight_keys
+            )
+
+    # Restore mid-run accumulators BEFORE the loop so subsequent record()
+    # calls persist the merged (old + new) state instead of overwriting it.
+    if checkpoint is not None and checkpoint.completed_count:
+        st = checkpoint.state
+        quant_metadata.update(st.get("quant_metadata", {}))
+        quantized_weight_keys.update(st.get("quantized_weight_keys", []))
+
     calibration_data_cache = {}
     # Generate calibration data for bias correction (always, even in simple mode)
     minimal("Scanning model and generating simulated calibration data...")
@@ -210,7 +256,39 @@ def convert_to_mxfp8(
     info(f"Found {total_weights} weight tensors to potentially process.")
     info("-" * 60)
 
+    # Tracks which output_tensors / lora_tensors entries have been persisted
+    # to the checkpoint so each weight key records exactly what it added.
+    _recorded_keys: set = set()
+    _recorded_lora_keys: set = set()
+
+    def _checkpoint_record(k: str) -> None:
+        added = {nk: t for nk, t in output_tensors.items() if nk not in _recorded_keys}
+        _recorded_keys.update(added.keys())
+        added_lora = {nk: t for nk, t in lora_tensors.items() if nk not in _recorded_lora_keys}
+        _recorded_lora_keys.update(added_lora.keys())
+        checkpoint.record(
+            k,
+            added,
+            lora=added_lora or None,
+            state={
+                "quant_metadata": quant_metadata,
+                "quantized_weight_keys": sorted(quantized_weight_keys),
+            },
+        )
+
     for i, key in enumerate(weight_keys):
+        if checkpoint is not None:
+            if checkpoint.is_done(key):
+                continue
+            if should_stop(stop_file):
+                info(
+                    f"Stop requested — {checkpoint.completed_count}/{total_weights} tensors "
+                    f"saved to checkpoint. Re-run the same command to resume."
+                )
+                loader.close()
+                restore_stop_signal_handlers()
+                raise StopRequested()
+
         tensor = loader.get_tensor(key)
         base_key = key.rsplit(".weight", 1)[0]
         exclusion_reason = ""
@@ -227,6 +305,8 @@ def convert_to_mxfp8(
         if tensor.dim() != 2:
             info(f"({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: non-2D tensor)")
             output_tensors[key] = tensor
+            if checkpoint is not None:
+                _checkpoint_record(key)
             skipped_count += 1
             continue
 
@@ -234,6 +314,8 @@ def convert_to_mxfp8(
         if exclusion_reason:
             info(f"({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: {exclusion_reason})")
             output_tensors[key] = tensor
+            if checkpoint is not None:
+                _checkpoint_record(key)
             skipped_count += 1
             continue
 
@@ -243,6 +325,8 @@ def convert_to_mxfp8(
             if should_skip:
                 info(f"({i + 1}/{total_weights}) Skipping tensor: {key} (Reason: {skip_reason})")
                 output_tensors[key] = tensor
+                if checkpoint is not None:
+                    _checkpoint_record(key)
                 skipped_count += 1
                 continue
 
@@ -352,6 +436,22 @@ def convert_to_mxfp8(
         if device == "cuda":
             torch.cuda.empty_cache()
 
+        if checkpoint is not None:
+            _checkpoint_record(key)
+
+    if checkpoint is not None and checkpoint.completed_count:
+        replayed = checkpoint.load_all()
+        output_tensors.update(replayed)
+        _recorded_keys.update(replayed.keys())
+        replayed_lora = checkpoint.load_lora()
+        if replayed_lora:
+            lora_tensors.update(replayed_lora)
+            _recorded_lora_keys.update(replayed_lora.keys())
+        info(
+            f"Replayed {checkpoint.completed_count} checkpointed tensors "
+            f"({len(replayed)} entries, {len(replayed_lora)} LoRA)."
+        )
+
     # Copy non-weight tensors (bias handled above, copy others)
     for key in all_keys:
         if key not in output_tensors:
@@ -406,3 +506,7 @@ def convert_to_mxfp8(
     info(f"  - Final tensor count    : {len(output_tensors)}")
     info("-" * 60)
     info("Conversion complete!")
+
+    if checkpoint is not None:
+        checkpoint.mark_finished()
+        restore_stop_signal_handlers()

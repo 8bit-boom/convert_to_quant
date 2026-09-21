@@ -87,8 +87,11 @@ def test_stopped_run_resumes_byte_identical(tmp_path):
         # Write the stop file as soon as the checkpoint has 3 entries.
         while not stop_written.is_set():
             if TensorCheckpoint.exists(str(cp_dir)):
-                cp = TensorCheckpoint.open(str(cp_dir))
-                if cp.completed_count >= 3:
+                try:
+                    completed = TensorCheckpoint.open(str(cp_dir)).completed_count
+                except (PermissionError, OSError):
+                    continue  # manifest being replaced; retry shortly
+                if completed >= 3:
                     Path(stop_file).write_text("")
                     stop_written.set()
                     return

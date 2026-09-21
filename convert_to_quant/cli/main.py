@@ -726,6 +726,9 @@ def run_conversion(args):
                 lora_depth=args.lora_depth,
                 lora_ar_threshold=args.lora_ar_threshold,
                 lora_output=args.lora_output,
+                # Checkpoint / stop-and-resume
+                checkpoint_dir=args.checkpoint_dir,
+                stop_file=args.stop_file,
             )
             return
 
@@ -839,6 +842,9 @@ def run_conversion(args):
                 lora_depth=args.lora_depth,
                 lora_ar_threshold=args.lora_ar_threshold,
                 lora_output=args.lora_output,
+                # Checkpoint / stop-and-resume
+                checkpoint_dir=args.checkpoint_dir,
+                stop_file=args.stop_file,
             )
             return
 

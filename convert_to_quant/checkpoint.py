@@ -236,12 +236,22 @@ class TensorCheckpoint:
     def is_done(self, key: str) -> bool:
         return key in self._done_keys
 
-    def record(self, key: str, tensors: Dict[str, Any], *, state: Optional[Dict[str, Any]] = None) -> None:
+    def record(
+        self,
+        key: str,
+        tensors: Dict[str, Any],
+        *,
+        lora: Optional[Dict[str, Any]] = None,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Persist the output tensors for one processed weight key.
 
         `tensors` may be empty (key produced no output, e.g. removed).
-        `state` (must be JSON-serializable) is merged into the manifest so
-        mid-run accumulators (quant metadata, processed-key sets) survive.
+        `lora` (optional) holds LoRA adapter tensors extracted for this key,
+        stored in a separate shard so replay never mixes them into the model
+        output. `state` (must be JSON-serializable) is merged into the
+        manifest so mid-run accumulators (quant metadata, processed-key
+        sets) survive.
         """
         if key in self._done_keys:
             return
@@ -251,6 +261,11 @@ class TensorCheckpoint:
             shard_name = f"{index:06d}.safetensors"
             self._write_shard(os.path.join(self.dir, SHARDS_DIRNAME, shard_name), tensors)
             entry["shard"] = shard_name
+        if lora:
+            lora_name = f"{index:06d}.lora.safetensors"
+            self._write_shard(os.path.join(self.dir, SHARDS_DIRNAME, lora_name), lora)
+            entry["lora_shard"] = lora_name
+            entry["n_lora_tensors"] = len(lora)
         self._entries.append(entry)
         self._done_keys.add(key)
         if state is not None:
@@ -270,6 +285,23 @@ class TensorCheckpoint:
             if not os.path.isfile(path):
                 raise CheckpointMismatchError(
                     f"Checkpoint shard missing: {path}. Delete the checkpoint and restart."
+                )
+            out.update(load_file(path))
+        return out
+
+    def load_lora(self) -> Dict[str, Any]:
+        """Replay every recorded LoRA shard into a single tensors dict, in order."""
+        from safetensors.torch import load_file
+
+        out: Dict[str, Any] = {}
+        for entry in self._entries:
+            shard = entry.get("lora_shard")
+            if shard is None:
+                continue
+            path = os.path.join(self.dir, SHARDS_DIRNAME, shard)
+            if not os.path.isfile(path):
+                raise CheckpointMismatchError(
+                    f"Checkpoint LoRA shard missing: {path}. Delete the checkpoint and restart."
                 )
             out.update(load_file(path))
         return out
